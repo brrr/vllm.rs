@@ -8,6 +8,7 @@ use std::path::PathBuf;
 /// - Downloading weights from remote storage
 /// - Loading weights from local files
 /// - Caching downloaded weights
+#[derive(Clone)]
 pub struct WeightLoader {
     /// Local cache directory for weights
     cache_dir: PathBuf,

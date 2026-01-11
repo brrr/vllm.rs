@@ -10,6 +10,7 @@ use zenoh::Session;
 
 use super::weight_loader::WeightLoader;
 
+#[derive(Clone)]
 /// Client for Zenoh-based communication with the BARM coordinator
 ///
 /// This client handles:
@@ -86,13 +87,26 @@ impl ZenohClient {
         Ok(())
     }
 
-    /// Send a heartbeat signal
+    /// Send a heartbeat signal periodically
     ///
     /// # Arguments
     /// * `worker_id` - This worker's ID
     pub async fn send_heartbeat(&self, worker_id: &str) -> Result<()> {
         // In Zenoh 1.x, we use liveliness tokens for heartbeats
         let key = format!("barm/worker/alive/{}", worker_id);
+        // Refresh the liveliness token periodically
+        let session = self.session.clone();
+        let token_key = key.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
+            loop {
+                interval.tick().await;
+                if let Err(e) = session.liveliness().declare_token(&token_key).await {
+                    tracing::error!("Failed to refresh liveliness token: {:?}", e);
+                }
+            }
+        });
+        // Initial declaration
         self.session.liveliness().declare_token(&key).await
             .map_err(|e| anyhow::anyhow!("Failed to declare liveliness token: {:?}", e))?;
         Ok(())
@@ -187,24 +201,48 @@ impl ZenohClient {
 
         tracing::info!("All subscribers created. Starting event loop...");
 
-        // Main event loop using tokio::select!
+        // Main event loop - run all handlers concurrently with shutdown signal
         let shutdown_rx = self.shutdown_tx.clone();
+        // Clone data for spawned tasks since tokio::spawn requires 'static
+        let model_name = model_name.to_string();
+        let model_name_for_config = model_name.clone();
+        let model_name_for_tokenizer = model_name.clone();
+        let model_name_for_weights = model_name.clone();
+        let self_for_config = self.clone();
+        let self_for_tokenizer = self.clone();
+        let self_for_weights = self.clone();
+        let self_for_model_load = self.clone();
 
+        // Spawn all handlers as independent tasks
+        let config_h = tokio::spawn(async move {
+            self_for_config.handle_config_subscriber(config_sub, &model_name_for_config).await
+        });
+        let tokenizer_h = tokio::spawn(async move {
+            self_for_tokenizer.handle_tokenizer_subscriber(tokenizer_sub, &model_name_for_tokenizer).await
+        });
+        let weights_h = tokio::spawn(async move {
+            self_for_weights.handle_weights_subscriber(weights_sub, &model_name_for_weights).await
+        });
+        let model_load_h = tokio::spawn(async move {
+            self_for_model_load.handle_model_load_subscriber(model_load_sub).await
+        });
+
+        // Wait for shutdown signal or any handler error
         tokio::select! {
-            _ = self.handle_config_subscriber(config_sub, model_name) => {
-                tracing::info!("Config subscriber ended");
-            }
-            _ = self.handle_tokenizer_subscriber(tokenizer_sub, model_name) => {
-                tracing::info!("Tokenizer subscriber ended");
-            }
-            _ = self.handle_weights_subscriber(weights_sub, model_name) => {
-                tracing::info!("Weights subscriber ended");
-            }
-            _ = self.handle_model_load_subscriber(model_load_sub) => {
-                tracing::info!("Model load subscriber ended");
-            }
             _ = shutdown_rx.closed() => {
                 tracing::info!("Shutdown signal received");
+            }
+            _ = config_h => {
+                tracing::info!("Config handler ended");
+            }
+            _ = tokenizer_h => {
+                tracing::info!("Tokenizer handler ended");
+            }
+            _ = weights_h => {
+                tracing::info!("Weights handler ended");
+            }
+            _ = model_load_h => {
+                tracing::info!("Model load handler ended");
             }
         }
 
@@ -278,9 +316,9 @@ impl ZenohClient {
             let bytes = sample.payload().to_bytes();
             // Extract shard index from path (e.g., "barm/model/model_name/weights/shard-001")
             let shard_index = extract_shard_index(&path)
-                .unwrap_or_else(|| "unknown".to_string());
+                .unwrap_or_else(|| "0".to_string());
 
-            match self.weight_loader.load_weights(model_name, shard_index.as_str(), bytes.as_ref()).await {
+            match self.weight_loader.load_weights(model_name, &shard_index, bytes.as_ref()).await {
                 Ok(weight_path) => {
                     tracing::info!("Weight shard saved to: {:?}", weight_path);
                 }
@@ -333,7 +371,12 @@ fn extract_shard_index(path: &str) -> Option<String> {
         let shard_part = &path[start + 6..];
         // Take up to 3 characters (e.g., "001", "001\n")
         let end = shard_part.find(|c: char| !c.is_ascii_digit()).unwrap_or(shard_part.len());
-        Some(shard_part[..end].to_string())
+        // Bounds check before slicing to avoid panic
+        if end > 0 && end <= shard_part.len() {
+            Some(shard_part[..end].to_string())
+        } else {
+            None
+        }
     } else {
         None
     }

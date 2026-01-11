@@ -45,7 +45,8 @@ async fn main() -> Result<()> {
     // Check if barm-worker mode is enabled
     let barm_args = BarmWorkerArgs::parse();
     if barm_args.barm_worker {
-        let zenoh_peer = barm_args.zenoh_peer.unwrap_or_default();
+        let zenoh_peer = barm_args.zenoh_peer
+            .unwrap_or_else(|| "127.0.0.1:7447".to_string());
         let model_name = barm_args.model_name.unwrap_or_else(|| "default-model".to_string());
         let cache_dir = barm_args.cache_dir.unwrap_or_else(|| std::path::PathBuf::from("/tmp/barm-cache"));
 
