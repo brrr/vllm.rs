@@ -24,6 +24,12 @@ struct BarmWorkerArgs {
     /// Zenoh peer endpoint
     #[arg(long)]
     zenoh_peer: Option<String>,
+    /// Model name to receive assets for
+    #[arg(long)]
+    model_name: Option<String>,
+    /// Cache directory for model assets
+    #[arg(long)]
+    cache_dir: Option<std::path::PathBuf>,
 }
 
 // Import for barm worker module
@@ -39,7 +45,11 @@ async fn main() -> Result<()> {
     // Check if barm-worker mode is enabled
     let barm_args = BarmWorkerArgs::parse();
     if barm_args.barm_worker {
-        if let Err(e) = barm_worker::run(barm_args.zenoh_peer.unwrap_or_default()).await {
+        let zenoh_peer = barm_args.zenoh_peer.unwrap_or_default();
+        let model_name = barm_args.model_name.unwrap_or_else(|| "default-model".to_string());
+        let cache_dir = barm_args.cache_dir.unwrap_or_else(|| std::path::PathBuf::from("/tmp/barm-cache"));
+
+        if let Err(e) = barm_worker::run(zenoh_peer, model_name, cache_dir).await {
             tracing::error!("Barm worker error: {:?}", e);
             return Err(candle_core::Error::msg(e.to_string()));
         }
