@@ -50,7 +50,7 @@ impl ZenohClient {
     ///
     /// # Returns
     /// The response from the coordinator containing worker ID and config
-    pub async fn register(&mut self) -> Result<WorkerRegistrationResponse> {
+    pub async fn register(&self) -> Result<WorkerRegistrationResponse> {
         // TODO: Implement registration logic
         Ok(WorkerRegistrationResponse {
             worker_id: "TODO".to_string(),
@@ -79,7 +79,7 @@ impl ZenohClient {
     pub async fn send_heartbeat(&self, worker_id: &str) -> Result<()> {
         // In Zenoh 1.x, we use liveliness tokens for heartbeats
         let key = format!("barm/worker/alive/{}", worker_id);
-        let _ = self.session.liveliness().declare_token(&key).await
+        self.session.liveliness().declare_token(&key).await
             .map_err(|e| anyhow::anyhow!("Failed to declare liveliness token: {:?}", e))?;
         Ok(())
     }
@@ -99,18 +99,17 @@ impl ZenohClient {
     }
 
     /// Run the client, listening for inference requests
-    pub async fn run(&self) {
-        let subscriber = match self.session.declare_subscriber("barm/inference/request/**").await {
-            Ok(sub) => sub,
-            Err(e) => {
-                tracing::error!("Failed to declare subscriber: {:?}", e);
-                return;
-            }
-        };
+    ///
+    /// # Returns
+    /// Result indicating success or failure
+    pub async fn run(&self) -> Result<()> {
+        let subscriber = self.session.declare_subscriber("barm/inference/request/**").await
+            .map_err(|e| anyhow::anyhow!("Failed to declare subscriber: {:?}", e))?;
         tracing::info!("Listening for inference requests...");
         while let Ok(sample) = subscriber.recv_async().await {
             tracing::debug!("Received request: {:?}", sample.payload());
         }
+        Ok(())
     }
 }
 
