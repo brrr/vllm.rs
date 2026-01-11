@@ -1,5 +1,5 @@
 use candle_core::Result;
-use clap::Parser;
+use clap::{Parser, Arg, ArgAction};
 use colored::Colorize;
 use reedline::{DefaultPrompt, DefaultPromptSegment, Reedline, Signal};
 use serde_json;
@@ -16,20 +16,20 @@ use vllm_rs::utils::config::GenerationConfig;
 use vllm_rs::utils::config::{EngineConfig, SamplingParams};
 use vllm_rs::utils::get_dtype;
 
-// Barm worker arguments
+// Barm worker arguments - must be parsed BEFORE main Args
 #[derive(clap::Parser, Debug)]
 struct BarmWorkerArgs {
     /// Enable barm worker mode
-    #[arg(long)]
+    #[arg(long, hide = true)]
     barm_worker: bool,
     /// Zenoh peer endpoint
-    #[arg(long)]
+    #[arg(long, hide = true)]
     zenoh_peer: Option<String>,
     /// Model name to receive assets for
-    #[arg(long)]
+    #[arg(long, hide = true)]
     model_name: Option<String>,
     /// Cache directory for model assets
-    #[arg(long)]
+    #[arg(long, hide = true)]
     cache_dir: Option<std::path::PathBuf>,
 }
 
@@ -41,11 +41,13 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
         .init();
-    let args = Args::parse();
 
-    // Check if barm-worker mode is enabled
-    let barm_args = BarmWorkerArgs::parse();
-    if barm_args.barm_worker {
+    // Check for barm-worker mode FIRST using raw arguments
+    // This is needed because vllm-rs Args doesn't know about --barm-worker
+    let barm_worker_mode = std::env::args().any(|arg| arg == "--barm-worker");
+
+    if barm_worker_mode {
+        let barm_args = BarmWorkerArgs::parse();
         let zenoh_peer = barm_args.zenoh_peer
             .unwrap_or_else(|| "127.0.0.1:7447".to_string());
         let model_name = barm_args.model_name.unwrap_or_else(|| "default-model".to_string());
@@ -57,6 +59,8 @@ async fn main() -> Result<()> {
         }
         return Ok(());
     }
+
+    let args = Args::parse();
 
     if args.model_id.is_none() && args.weight_path.is_none() && args.weight_file.is_none() {
         candle_core::bail!("Must provide model_id or weight_path or weight_file!");

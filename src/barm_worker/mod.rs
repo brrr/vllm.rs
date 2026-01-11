@@ -3,9 +3,11 @@ use std::path::PathBuf;
 
 pub mod zenoh_client;
 pub mod weight_loader;
+pub mod model_loader;
 
 pub use zenoh_client::ZenohClient;
 pub use weight_loader::WeightLoader;
+pub use model_loader::ModelEngine;
 
 /// Run the barm worker with the given Zenoh peer endpoint
 ///
@@ -17,7 +19,7 @@ pub use weight_loader::WeightLoader;
 /// # Returns
 /// Result indicating success or failure
 pub async fn run(zenoh_peer: String, model_name: String, cache_dir: PathBuf) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let client = ZenohClient::new(&zenoh_peer, cache_dir).await
+    let mut client = ZenohClient::new(&zenoh_peer, cache_dir).await
         .context("Failed to create Zenoh client")?;
     tracing::info!("Barm worker connected to {} for model: {}", zenoh_peer, model_name);
     client.run(&model_name).await
