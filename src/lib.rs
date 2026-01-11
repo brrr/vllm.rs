@@ -1,6 +1,7 @@
 #[cfg(feature = "python")]
 use pyo3::prelude::*;
 pub mod api;
+pub mod barm_worker;
 pub mod core;
 pub mod mcp;
 pub mod models;

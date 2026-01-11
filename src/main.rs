@@ -16,12 +16,47 @@ use vllm_rs::utils::config::GenerationConfig;
 use vllm_rs::utils::config::{EngineConfig, SamplingParams};
 use vllm_rs::utils::get_dtype;
 
+// Barm worker arguments
+#[derive(clap::Parser, Debug)]
+struct BarmWorkerArgs {
+    /// Enable barm worker mode
+    #[arg(long)]
+    barm_worker: bool,
+    /// Zenoh peer endpoint
+    #[arg(long)]
+    zenoh_peer: Option<String>,
+    /// Model name to receive assets for
+    #[arg(long)]
+    model_name: Option<String>,
+    /// Cache directory for model assets
+    #[arg(long)]
+    cache_dir: Option<std::path::PathBuf>,
+}
+
+// Import for barm worker module
+use vllm_rs::barm_worker;
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
         .init();
     let args = Args::parse();
+
+    // Check if barm-worker mode is enabled
+    let barm_args = BarmWorkerArgs::parse();
+    if barm_args.barm_worker {
+        let zenoh_peer = barm_args.zenoh_peer
+            .unwrap_or_else(|| "127.0.0.1:7447".to_string());
+        let model_name = barm_args.model_name.unwrap_or_else(|| "default-model".to_string());
+        let cache_dir = barm_args.cache_dir.unwrap_or_else(|| std::path::PathBuf::from("/tmp/barm-cache"));
+
+        if let Err(e) = barm_worker::run(zenoh_peer, model_name, cache_dir).await {
+            tracing::error!("Barm worker error: {:?}", e);
+            return Err(candle_core::Error::msg(e.to_string()));
+        }
+        return Ok(());
+    }
 
     if args.model_id.is_none() && args.weight_path.is_none() && args.weight_file.is_none() {
         candle_core::bail!("Must provide model_id or weight_path or weight_file!");
