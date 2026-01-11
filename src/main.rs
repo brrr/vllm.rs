@@ -15,12 +15,33 @@ use vllm_rs::utils::config::GenerationConfig;
 use vllm_rs::utils::config::{EngineConfig, SamplingParams};
 use vllm_rs::utils::get_dtype;
 
+// Barm worker arguments
+#[derive(clap::Parser, Debug)]
+struct BarmWorkerArgs {
+    /// Enable barm worker mode
+    #[arg(long)]
+    barm_worker: bool,
+    /// Zenoh peer endpoint
+    #[arg(long)]
+    zenoh_peer: Option<String>,
+}
+
+// Import for barm worker module (will be created in Task 2)
+use vllm_rs_barm_worker;
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
         .init();
     let args = Args::parse();
+
+    // Check if barm-worker mode is enabled
+    let barm_args = BarmWorkerArgs::parse();
+    if barm_args.barm_worker {
+        vllm_rs_barm_worker::run(barm_args.zenoh_peer).await?;
+        return Ok(());
+    }
 
     if args.model_id.is_none() && args.weight_path.is_none() && args.weight_file.is_none() {
         candle_core::bail!("Must provide model_id or weight_path or weight_file!");
