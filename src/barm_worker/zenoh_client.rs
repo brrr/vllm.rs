@@ -97,6 +97,21 @@ impl ZenohClient {
             .map_err(|e| anyhow::anyhow!("Failed to declare subscriber: {:?}", e))?;
         Ok(subscriber)
     }
+
+    /// Run the client, listening for inference requests
+    pub async fn run(&self) {
+        let subscriber = match self.session.declare_subscriber("barm/inference/request/**").await {
+            Ok(sub) => sub,
+            Err(e) => {
+                tracing::error!("Failed to declare subscriber: {:?}", e);
+                return;
+            }
+        };
+        tracing::info!("Listening for inference requests...");
+        while let Ok(sample) = subscriber.recv_async().await {
+            tracing::debug!("Received request: {:?}", sample.payload());
+        }
+    }
 }
 
 /// Response from coordinator during worker registration

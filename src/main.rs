@@ -26,8 +26,8 @@ struct BarmWorkerArgs {
     zenoh_peer: Option<String>,
 }
 
-// Import for barm worker module (will be created in Task 2)
-use vllm_rs_barm_worker;
+// Import for barm worker module
+use vllm_rs::barm_worker;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -39,7 +39,10 @@ async fn main() -> Result<()> {
     // Check if barm-worker mode is enabled
     let barm_args = BarmWorkerArgs::parse();
     if barm_args.barm_worker {
-        vllm_rs_barm_worker::run(barm_args.zenoh_peer).await?;
+        if let Err(e) = barm_worker::run(barm_args.zenoh_peer.unwrap_or_default()).await {
+            tracing::error!("Barm worker error: {:?}", e);
+            return Err(candle_core::Error::msg(e.to_string()));
+        }
         return Ok(());
     }
 
