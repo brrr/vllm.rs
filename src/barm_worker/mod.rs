@@ -7,7 +7,7 @@ pub mod model_loader;
 
 pub use zenoh_client::ZenohClient;
 pub use weight_loader::WeightLoader;
-pub use model_loader::ModelEngine;
+pub use model_loader::{ModelEngine, MemoryConfig};
 
 /// Run the barm worker with the given Zenoh peer endpoint
 ///
@@ -33,7 +33,14 @@ pub async fn run(
     tracing::info!("Barm worker memory config: max_model_len={:?}, max_num_seqs={:?}, kv_fraction={:?}",
         max_model_len, max_num_seqs, kv_fraction);
 
-    let mut client = ZenohClient::new(&zenoh_peer, cache_dir).await
+    // Create memory config from command-line args
+    let memory_config = MemoryConfig {
+        max_model_len,
+        max_num_seqs,
+        kv_fraction,
+    };
+
+    let mut client = ZenohClient::new(&zenoh_peer, cache_dir, memory_config).await
         .context("Failed to create Zenoh client")?;
     tracing::info!("Barm worker connected to {} for model: {}", zenoh_peer, model_name);
     client.run(&model_name).await

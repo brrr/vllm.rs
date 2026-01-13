@@ -9,7 +9,7 @@ use zenoh::sample::Sample;
 use zenoh::Config;
 use zenoh::Session;
 
-use super::model_loader::ModelEngine;
+use super::model_loader::{ModelEngine, MemoryConfig};
 use super::weight_loader::WeightLoader;
 
 /// Shared shutdown signal using watch channel (supports cloning)
@@ -135,6 +135,8 @@ pub struct ZenohClient {
     chunked_transfer_tracker: Arc<ChunkedTransferTracker>,
     /// Model name
     model_name: String,
+    /// Memory configuration
+    memory_config: MemoryConfig,
 }
 
 impl ZenohClient {
@@ -143,10 +145,11 @@ impl ZenohClient {
     /// # Arguments
     /// * `peer` - The Zenoh peer endpoint to connect to
     /// * `cache_dir` - Directory for caching model assets
+    /// * `memory_config` - Memory configuration for model loading
     ///
     /// # Returns
     /// A new ZenohClient instance
-    pub async fn new(peer: &str, cache_dir: PathBuf) -> Result<Self> {
+    pub async fn new(peer: &str, cache_dir: PathBuf, memory_config: MemoryConfig) -> Result<Self> {
         let config_str = format!(r#"{{
             mode: "client",
             connect: {{
@@ -171,6 +174,7 @@ impl ZenohClient {
             asset_tracker: Arc::new(AssetTracker::new()),
             chunked_transfer_tracker: Arc::new(ChunkedTransferTracker::new()),
             model_name: String::new(),
+            memory_config,
         })
     }
 
@@ -386,10 +390,10 @@ impl ZenohClient {
         // Store model name
         self.model_name = model_name.to_string();
 
-        // Initialize model engine
+        // Initialize model engine with memory configuration
         {
             let mut guard = self.model_engine.lock().await;
-            *guard = ModelEngine::new(model_name.to_string());
+            *guard = ModelEngine::with_memory_config(model_name.to_string(), self.memory_config.clone());
         }
 
         // Create subscribers for all asset types

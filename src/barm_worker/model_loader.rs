@@ -8,6 +8,17 @@ use tracing::info;
 use crate::core::engine::LLMEngine;
 use crate::utils::config::{EngineConfig, SamplingParams};
 
+/// Memory configuration for model loading
+#[derive(Clone, Debug, Default)]
+pub struct MemoryConfig {
+    /// Maximum model context length
+    pub max_model_len: Option<usize>,
+    /// Maximum concurrent sequences
+    pub max_num_seqs: Option<usize>,
+    /// KV cache memory fraction (0.0-1.0)
+    pub kv_fraction: Option<f32>,
+}
+
 /// ModelEngine - Wraps vLLM.rs LLMEngine for barm-worker inference
 ///
 /// This struct manages the lifecycle of the vLLM.rs inference engine,
@@ -18,6 +29,8 @@ pub struct ModelEngine {
     engine: Option<Arc<RwLock<LLMEngine>>>,
     /// Model name
     model_name: String,
+    /// Memory configuration
+    memory_config: MemoryConfig,
 }
 
 impl ModelEngine {
@@ -32,7 +45,22 @@ impl ModelEngine {
         Self {
             engine: None,
             model_name,
+            memory_config: MemoryConfig::default(),
         }
+    }
+
+    /// Create a new ModelEngine with memory configuration
+    pub fn with_memory_config(model_name: String, memory_config: MemoryConfig) -> Self {
+        Self {
+            engine: None,
+            model_name,
+            memory_config,
+        }
+    }
+
+    /// Set memory configuration
+    pub fn set_memory_config(&mut self, config: MemoryConfig) {
+        self.memory_config = config;
     }
 
     /// Check if model is loaded
@@ -67,6 +95,14 @@ impl ModelEngine {
         // The downloader will check for weights/shard-000.safetensors within model_dir
         let weight_path = model_dir.to_string_lossy().to_string();
 
+        // Use memory config or sensible defaults
+        let max_num_seqs = self.memory_config.max_num_seqs.unwrap_or(4);
+        let max_model_len = self.memory_config.max_model_len.unwrap_or(512);
+        let kv_fraction = self.memory_config.kv_fraction;
+
+        info!("Using memory config: max_model_len={}, max_num_seqs={}, kv_fraction={:?}",
+              max_model_len, max_num_seqs, kv_fraction);
+
         // Create engine config - point to local files
         // For local weights, use weight_path only (model_id should be None to match
         // the (None, Some(path), None) case in prepare_model_weights)
@@ -76,9 +112,9 @@ impl ModelEngine {
             None,                                             // weight_file
             None,                                             // hf_token
             None,                                             // hf_token_path
-            Some(16),                                         // max_num_seqs
+            Some(max_num_seqs),                               // max_num_seqs
             None,                                             // config_model_len
-            Some(32768),                                      // max_model_len
+            Some(max_model_len),                              // max_model_len
             Some(1024),                                       // max_tokens
             None,                                             // isq
             Some(1),                                          // num_shards
@@ -90,13 +126,13 @@ impl ModelEngine {
             None,                                             // fp8_kvcache
             Some(false),                                      // server_mode (false for embedded use)
             None,                                             // cpu_mem_fold
-            None,                                             // kv_fraction
+            kv_fraction,                                      // kv_fraction
             None,                                             // pd_config
             None,                                             // mcp_command
             None,                                             // mcp_config
             None,                                             // mcp_args
             None,                                             // disable_flash_attn
-            None,                                          // tool_prompt_template
+            None,                                             // tool_prompt_template
         );
 
         // Create engine on blocking runtime
