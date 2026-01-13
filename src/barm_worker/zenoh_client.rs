@@ -179,9 +179,32 @@ impl ZenohClient {
     /// # Returns
     /// The response from the coordinator containing worker ID and config
     pub async fn register(&self) -> Result<WorkerRegistrationResponse> {
-        // TODO: Implement registration logic
+        // Generate a unique worker ID
+        let worker_id = format!("vllm-worker-{}", uuid::Uuid::new_v4().to_string().split('-').next().unwrap_or("unknown"));
+
+        // Create registration message
+        let registration = serde_json::json!({
+            "id": worker_id,
+            "endpoint": "barm-worker",
+            "resources": {
+                "device": "metal",  // TODO: detect actual device
+                "memory": 0,
+            }
+        });
+
+        // Publish to worker registration topic
+        let registration_topic = format!("barm/workers/{}", worker_id);
+
+        let publisher = self.session.declare_publisher(&registration_topic).await
+            .map_err(|e| anyhow::anyhow!("Failed to declare publisher: {:?}", e))?;
+
+        publisher.put(&registration.to_string()).await
+            .map_err(|e| anyhow::anyhow!("Failed to publish registration: {:?}", e))?;
+
+        tracing::info!("Worker registered as {}", worker_id);
+
         Ok(WorkerRegistrationResponse {
-            worker_id: "TODO".to_string(),
+            worker_id,
             model_config: None,
         })
     }

@@ -31,6 +31,15 @@ struct BarmWorkerArgs {
     /// Cache directory for model assets
     #[arg(long, hide = true)]
     cache_dir: Option<std::path::PathBuf>,
+    /// Maximum model context length
+    #[arg(long, hide = true)]
+    max_model_len: Option<usize>,
+    /// Maximum number of concurrent sequences
+    #[arg(long, hide = true)]
+    max_num_seqs: Option<usize>,
+    /// KV cache memory fraction (0.0-1.0)
+    #[arg(long, hide = true)]
+    kv_fraction: Option<f32>,
 }
 
 // Import for barm worker module
@@ -53,7 +62,14 @@ async fn main() -> Result<()> {
         let model_name = barm_args.model_name.unwrap_or_else(|| "default-model".to_string());
         let cache_dir = barm_args.cache_dir.unwrap_or_else(|| std::path::PathBuf::from("/tmp/barm-cache"));
 
-        if let Err(e) = barm_worker::run(zenoh_peer, model_name, cache_dir).await {
+        if let Err(e) = barm_worker::run(
+            zenoh_peer,
+            model_name,
+            cache_dir,
+            barm_args.max_model_len,
+            barm_args.max_num_seqs,
+            barm_args.kv_fraction,
+        ).await {
             tracing::error!("Barm worker error: {:?}", e);
             return Err(candle_core::Error::msg(e.to_string()));
         }
