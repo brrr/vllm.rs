@@ -110,10 +110,23 @@ impl Downloader {
                                     "model.safetensors.index.json",
                                 )?
                             } else {
-                                //a single weight file case
+                                //a single weight file case - check for model.safetensors or shard-000.safetensors
+                                // Also check in weights/ subdirectory for chunked transfer naming
                                 let mut safetensors_files = Vec::<std::path::PathBuf>::new();
-                                safetensors_files
-                                    .insert(0, Path::new(path).join("model.safetensors"));
+                                if Path::new(path).join("model.safetensors").exists() {
+                                    safetensors_files
+                                        .insert(0, Path::new(path).join("model.safetensors"));
+                                } else if Path::new(path).join("weights/shard-000.safetensors").exists() {
+                                    // Support for chunked transfer with weights in weights/ subdirectory
+                                    safetensors_files
+                                        .insert(0, Path::new(path).join("weights/shard-000.safetensors"));
+                                } else if Path::new(path).join("shard-000.safetensors").exists() {
+                                    // Support for chunked transfer naming convention
+                                    safetensors_files
+                                        .insert(0, Path::new(path).join("shard-000.safetensors"));
+                                } else {
+                                    candle_core::bail!("No safetensors weight file found in {:?}. Expected model.safetensors, weights/shard-000.safetensors, or shard-000.safetensors", path);
+                                }
                                 safetensors_files
                             },
                             generation_config_filename: if Path::new(path)

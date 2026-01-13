@@ -70,6 +70,47 @@ impl AssetTracker {
     }
 }
 
+/// Track chunked weight transfer progress
+#[derive(Clone, Default)]
+struct ChunkedTransferTracker {
+    /// Track active transfers: shard_index -> (file_size, total_chunks, chunks_received)
+    active_transfers: Arc<Mutex<std::collections::HashMap<u32, (u64, u32, std::sync::atomic::AtomicU32)>>>,
+}
+
+impl ChunkedTransferTracker {
+    fn new() -> Self {
+        Self {
+            active_transfers: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        }
+    }
+
+    async fn start_transfer(&self, shard_index: u32, file_size: u64, total_chunks: u32) {
+        let mut transfers = self.active_transfers.lock().await;
+        transfers.insert(shard_index, (file_size, total_chunks, std::sync::atomic::AtomicU32::new(0)));
+        tracing::info!("Started chunked transfer for shard {}: {} bytes, {} chunks", shard_index, file_size, total_chunks);
+    }
+
+    async fn add_chunk(&self, shard_index: u32) -> u32 {
+        let mut transfers = self.active_transfers.lock().await;
+        if let Some((_, _, received)) = transfers.get_mut(&shard_index) {
+            let count = received.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            return count + 1;
+        }
+        0
+    }
+
+    async fn get_progress(&self, shard_index: u32) -> Option<(u64, u32, u32)> {
+        let transfers = self.active_transfers.lock().await;
+        transfers.get(&shard_index).map(|(size, total, received)| (*size, *total, received.load(std::sync::atomic::Ordering::SeqCst)))
+    }
+
+    async fn remove_transfer(&self, shard_index: u32) {
+        let mut transfers = self.active_transfers.lock().await;
+        transfers.remove(&shard_index);
+        tracing::info!("Removed chunked transfer tracking for shard {}", shard_index);
+    }
+}
+
 #[derive(Clone)]
 /// Client for Zenoh-based communication with the BARM coordinator
 ///
@@ -90,6 +131,8 @@ pub struct ZenohClient {
     shutdown: ShutdownSignal,
     /// Asset tracker
     asset_tracker: Arc<AssetTracker>,
+    /// Chunked transfer tracker
+    chunked_transfer_tracker: Arc<ChunkedTransferTracker>,
     /// Model name
     model_name: String,
 }
@@ -126,6 +169,7 @@ impl ZenohClient {
             model_engine: Arc::new(Mutex::new(ModelEngine::new(String::new()))),
             shutdown,
             asset_tracker: Arc::new(AssetTracker::new()),
+            chunked_transfer_tracker: Arc::new(ChunkedTransferTracker::new()),
             model_name: String::new(),
         })
     }
@@ -145,14 +189,24 @@ impl ZenohClient {
     /// Submit an inference result to the coordinator
     ///
     /// # Arguments
-    /// * `request_id` - The original request ID
-    /// * `result` - The inference result
-    pub async fn submit_result(&self, request_id: &str, result: &str) -> Result<()> {
-        let key = format!("barm/result/{}", request_id);
-        let publisher = self.session.declare_publisher(&key).await
+    /// * `task_id` - The original task ID
+    /// * `result` - The inference result text
+    pub async fn submit_result(&self, task_id: &str, result: &str, token_count: usize) -> Result<()> {
+        // Use the response topic that coordinator's inference_dispatcher listens on
+        let response_topic = format!("barm/inference/{}/response", self.model_name);
+
+        let response = serde_json::json!({
+            "task_id": task_id,
+            "text": result,
+            "token_count": token_count
+        });
+
+        let publisher = self.session.declare_publisher(&response_topic).await
             .map_err(|e| anyhow::anyhow!("Failed to declare publisher: {:?}", e))?;
-        publisher.put(result).await
+        publisher.put(&response.to_string()).await
             .map_err(|e| anyhow::anyhow!("Failed to publish result: {:?}", e))?;
+
+        tracing::info!("Submitted result for task {} to {}", task_id, response_topic);
         Ok(())
     }
 
@@ -225,6 +279,36 @@ impl ZenohClient {
         Ok(subscriber)
     }
 
+    /// Subscribe to tokenizer_config updates
+    ///
+    /// # Arguments
+    /// * `model_name` - The model name to subscribe to
+    ///
+    /// # Returns
+    /// A subscriber for tokenizer_config messages
+    pub async fn subscribe_tokenizer_config(&self, model_name: &str) -> Result<Subscriber<FifoChannelHandler<Sample>>> {
+        let key_expr = format!("barm/model/{}/tokenizer_config", model_name);
+        let subscriber = self.session.declare_subscriber(&key_expr).await
+            .map_err(|e| anyhow::anyhow!("Failed to declare tokenizer_config subscriber: {:?}", e))?;
+        tracing::info!("Subscribed to tokenizer_config: {}", key_expr);
+        Ok(subscriber)
+    }
+
+    /// Subscribe to generation_config updates
+    ///
+    /// # Arguments
+    /// * `model_name` - The model name to subscribe to
+    ///
+    /// # Returns
+    /// A subscriber for generation_config messages
+    pub async fn subscribe_generation_config(&self, model_name: &str) -> Result<Subscriber<FifoChannelHandler<Sample>>> {
+        let key_expr = format!("barm/model/{}/generation_config", model_name);
+        let subscriber = self.session.declare_subscriber(&key_expr).await
+            .map_err(|e| anyhow::anyhow!("Failed to declare generation_config subscriber: {:?}", e))?;
+        tracing::info!("Subscribed to generation_config: {}", key_expr);
+        Ok(subscriber)
+    }
+
     /// Subscribe to weight updates (sharded safetensors)
     ///
     /// # Arguments
@@ -288,6 +372,8 @@ impl ZenohClient {
         // Create subscribers for all asset types
         let config_sub = self.subscribe_config(model_name).await?;
         let tokenizer_sub = self.subscribe_tokenizer(model_name).await?;
+        let tokenizer_config_sub = self.subscribe_tokenizer_config(model_name).await?;
+        let generation_config_sub = self.subscribe_generation_config(model_name).await?;
         let weights_sub = self.subscribe_weights(model_name).await?;
         let model_load_sub = self.subscribe_model_load().await?;
         let inference_sub = self.subscribe_inference_requests().await?;
@@ -299,9 +385,13 @@ impl ZenohClient {
         let model_name = model_name.to_string();
         let model_name_for_config = model_name.clone();
         let model_name_for_tokenizer = model_name.clone();
+        let model_name_for_tokenizer_config = model_name.clone();
+        let model_name_for_generation_config = model_name.clone();
         let model_name_for_weights = model_name.clone();
         let self_for_config = self.clone();
         let self_for_tokenizer = self.clone();
+        let self_for_tokenizer_config = self.clone();
+        let self_for_generation_config = self.clone();
         let self_for_weights = self.clone();
         let self_for_model_load = self.clone();
         let self_for_inference = self.clone();
@@ -314,6 +404,12 @@ impl ZenohClient {
         let tokenizer_h = tokio::spawn(async move {
             self_for_tokenizer.handle_tokenizer_subscriber(tokenizer_sub, &model_name_for_tokenizer).await
         });
+        let tokenizer_config_h = tokio::spawn(async move {
+            self_for_tokenizer_config.handle_tokenizer_config_subscriber(tokenizer_config_sub, &model_name_for_tokenizer_config).await
+        });
+        let generation_config_h = tokio::spawn(async move {
+            self_for_generation_config.handle_generation_config_subscriber(generation_config_sub, &model_name_for_generation_config).await
+        });
         let weights_h = tokio::spawn(async move {
             self_for_weights.handle_weights_subscriber(weights_sub, &model_name_for_weights).await
         });
@@ -324,27 +420,10 @@ impl ZenohClient {
             self_for_inference.handle_inference_requests(inference_sub).await
         });
 
-        // Wait for shutdown signal or any handler error
-        tokio::select! {
-            _ = shutdown_rx.changed() => {
-                tracing::info!("Shutdown signal received");
-            }
-            _ = config_h => {
-                tracing::info!("Config handler ended");
-            }
-            _ = tokenizer_h => {
-                tracing::info!("Tokenizer handler ended");
-            }
-            _ = weights_h => {
-                tracing::info!("Weights handler ended");
-            }
-            _ = model_load_h => {
-                tracing::info!("Model load handler ended");
-            }
-            _ = inference_h => {
-                tracing::info!("Inference handler ended");
-            }
-        }
+        // Wait for shutdown signal only - handlers should continue running indefinitely
+        // until shutdown is received
+        shutdown_rx.changed().await?;
+        tracing::info!("Shutdown signal received, stopping workers...");
 
         Ok(())
     }
@@ -387,12 +466,12 @@ impl ZenohClient {
         drop(engine);
 
         match engine_clone.complete("what is the capital of China", 100, Some(0.7)).await {
-            Ok(result) => {
-                tracing::info!("Test inference result: {}", result);
+            Ok((result, token_count)) => {
+                tracing::info!("Test inference result: {} ({} tokens)", result, token_count);
 
                 // Submit result to coordinator (for demo purposes, use a test request ID)
                 let request_id = "test-001".to_string();
-                if let Err(e) = self.submit_result(&request_id, &result).await {
+                if let Err(e) = self.submit_result(&request_id, &result, token_count).await {
                     tracing::error!("Failed to submit test result: {:?}", e);
                 }
             }
@@ -407,7 +486,7 @@ impl ZenohClient {
         &self,
         subscriber: Subscriber<FifoChannelHandler<Sample>>,
         model_name: &str,
-    ) -> Result<()> {
+    ) {
         tracing::info!("Handling config messages for model: {}", model_name);
 
         loop {
@@ -428,8 +507,9 @@ impl ZenohClient {
                     }
                 }
                 Err(e) => {
-                    tracing::error!("Config subscriber error: {:?}", e);
-                    anyhow::bail!("Config subscriber error: {:?}", e);
+                    tracing::error!("Config subscriber error: {:?}, retrying...", e);
+                    // Wait before retrying
+                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                 }
             }
         }
@@ -440,7 +520,7 @@ impl ZenohClient {
         &self,
         subscriber: Subscriber<FifoChannelHandler<Sample>>,
         model_name: &str,
-    ) -> Result<()> {
+    ) {
         tracing::info!("Handling tokenizer messages for model: {}", model_name);
 
         loop {
@@ -461,8 +541,62 @@ impl ZenohClient {
                     }
                 }
                 Err(e) => {
-                    tracing::error!("Tokenizer subscriber error: {:?}", e);
-                    anyhow::bail!("Tokenizer subscriber error: {:?}", e);
+                    tracing::error!("Tokenizer subscriber error: {:?}, retrying...", e);
+                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                }
+            }
+        }
+    }
+
+    /// Handle tokenizer_config messages
+    async fn handle_tokenizer_config_subscriber(
+        &self,
+        subscriber: Subscriber<FifoChannelHandler<Sample>>,
+        model_name: &str,
+    ) {
+        tracing::info!("Handling tokenizer_config messages for model: {}", model_name);
+
+        loop {
+            match subscriber.recv_async().await {
+                Ok(sample) => {
+                    let path = sample.key_expr().to_string();
+                    tracing::info!("Received tokenizer_config for model {}: {}", model_name, path);
+
+                    let bytes = sample.payload().to_bytes();
+                    if let Err(e) = self.weight_loader.load_tokenizer_config(model_name, bytes.as_ref()).await {
+                        tracing::error!("Failed to save tokenizer_config: {:?}", e);
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Tokenizer_config subscriber error: {:?}, retrying...", e);
+                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                }
+            }
+        }
+    }
+
+    /// Handle generation_config messages
+    async fn handle_generation_config_subscriber(
+        &self,
+        subscriber: Subscriber<FifoChannelHandler<Sample>>,
+        model_name: &str,
+    ) {
+        tracing::info!("Handling generation_config messages for model: {}", model_name);
+
+        loop {
+            match subscriber.recv_async().await {
+                Ok(sample) => {
+                    let path = sample.key_expr().to_string();
+                    tracing::info!("Received generation_config for model {}: {}", model_name, path);
+
+                    let bytes = sample.payload().to_bytes();
+                    if let Err(e) = self.weight_loader.load_generation_config(model_name, bytes.as_ref()).await {
+                        tracing::error!("Failed to save generation_config: {:?}", e);
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Generation_config subscriber error: {:?}, retrying...", e);
+                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                 }
             }
         }
@@ -473,7 +607,7 @@ impl ZenohClient {
         &self,
         subscriber: Subscriber<FifoChannelHandler<Sample>>,
         model_name: &str,
-    ) -> Result<()> {
+    ) {
         tracing::info!("Handling weight messages for model: {}", model_name);
 
         let mut weight_count = 0;
@@ -482,33 +616,134 @@ impl ZenohClient {
             match subscriber.recv_async().await {
                 Ok(sample) => {
                     let path = sample.key_expr().to_string();
-                    tracing::info!("Received weight shard for model {}: {}", model_name, path);
-
                     let bytes = sample.payload().to_bytes();
-                    // Extract shard index from path (e.g., "barm/model/model_name/weights/shard-001")
-                    let shard_index = extract_shard_index(&path)
-                        .unwrap_or_else(|| "0".to_string());
 
-                    if let Err(e) = self.weight_loader.load_weights(model_name, &shard_index, bytes.as_ref()).await {
-                        tracing::error!("Failed to save weight shard: {:?}", e);
+                    // Determine message type based on path pattern
+                    if path.ends_with("/meta") {
+                        // Chunked transfer metadata
+                        self.handle_weight_metadata(model_name, &path, &bytes).await;
+                    } else if path.contains("/chunk-") {
+                        // Chunked transfer chunk
+                        self.handle_weight_chunk(model_name, &path, &bytes).await;
+                    } else if path.ends_with("/done") {
+                        // Chunked transfer done signal
+                        self.handle_weight_done(model_name, &path, &bytes).await;
                     } else {
-                        weight_count += 1;
-                        tracing::info!("Weight shard {} saved", weight_count);
-
-                        // Mark weights as received (after first weight shard)
-                        if weight_count == 1 {
-                            self.asset_tracker.mark_weights_received();
-                        }
-
-                        // Check if all assets are received
-                        self.check_and_load_model().await;
+                        // Direct weight transfer (legacy support)
+                        self.handle_direct_weight(model_name, &path, &bytes).await;
                     }
                 }
                 Err(e) => {
-                    tracing::error!("Weights subscriber error: {:?}", e);
-                    anyhow::bail!("Weights subscriber error: {:?}", e);
+                    tracing::error!("Weights subscriber error: {:?}, retrying...", e);
+                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                 }
             }
+        }
+    }
+
+    /// Handle weight metadata (start of chunked transfer)
+    async fn handle_weight_metadata(&self, model_name: &str, path: &str, data: &[u8]) {
+        let shard_index = extract_shard_index(path)
+            .unwrap_or_else(|| "0".to_string());
+
+        tracing::info!("Received weight metadata for shard {}: {}", shard_index, path);
+
+        if let Ok(metadata) = serde_json::from_slice::<serde_json::Value>(data) {
+            let file_size = metadata.get("file_size").and_then(|v| v.as_u64()).unwrap_or(0);
+            // Convert to u32 safely - values coming from JSON are i64
+            let total_chunks = metadata.get("total_chunks")
+                .and_then(|v| v.as_i64())
+                .map(|v| v as u32)
+                .unwrap_or(0);
+            let shard_idx = shard_index.parse::<u32>().unwrap_or(0);
+
+            // Start tracking this chunked transfer
+            self.chunked_transfer_tracker.start_transfer(shard_idx, file_size, total_chunks).await;
+
+            // Initialize the file on disk
+            if let Err(e) = self.weight_loader.start_chunked_weight_reception(
+                model_name, &shard_index, file_size, total_chunks
+            ).await {
+                tracing::error!("Failed to start chunked reception: {:?}", e);
+            }
+        } else {
+            tracing::error!("Failed to parse weight metadata");
+        }
+    }
+
+    /// Handle weight chunk
+    async fn handle_weight_chunk(&self, model_name: &str, path: &str, data: &[u8]) {
+        // Extract shard index and chunk index from path
+        // Format: barm/model/{model_name}/weights/shard-XXX/chunk-XXXXX
+        let shard_index = extract_shard_index(path)
+            .unwrap_or_else(|| "0".to_string());
+
+        // Extract chunk index from path
+        let chunk_index = if let Some(start) = path.rfind("chunk-") {
+            let chunk_str = &path[start + 6..];
+            chunk_str.split('/').next()
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
+        let shard_idx = shard_index.parse::<u32>().unwrap_or(0);
+
+        tracing::debug!("Received weight chunk {} for shard {}: {} bytes", chunk_index, shard_index, data.len());
+
+        if let Err(e) = self.weight_loader.write_weight_chunk(model_name, &shard_index, chunk_index, data).await {
+            tracing::error!("Failed to write weight chunk: {:?}", e);
+            return;
+        }
+
+        // Update progress
+        let received = self.chunked_transfer_tracker.add_chunk(shard_idx).await;
+        let progress = self.chunked_transfer_tracker.get_progress(shard_idx).await;
+
+        if let Some((_, total, _)) = progress {
+            if received % 100 == 0 || received == total {
+                tracing::info!("Weight shard {} progress: {}/{} chunks ({:.1}%)",
+                    shard_index, received, total, (received as f64 / total as f64) * 100.0);
+            }
+        }
+    }
+
+    /// Handle weight done signal (end of chunked transfer)
+    async fn handle_weight_done(&self, model_name: &str, path: &str, data: &[u8]) {
+        let shard_index = extract_shard_index(path)
+            .unwrap_or_else(|| "0".to_string());
+
+        tracing::info!("Received weight done signal for shard {}: {}", shard_index, path);
+
+        let shard_idx = shard_index.parse::<u32>().unwrap_or(0);
+
+        // Finalize the transfer
+        if let Err(e) = self.weight_loader.finalize_chunked_weight_reception(model_name, &shard_index).await {
+            tracing::error!("Failed to finalize chunked reception: {:?}", e);
+        }
+
+        // Mark weights as received
+        self.asset_tracker.mark_weights_received();
+
+        // Clean up tracking
+        self.chunked_transfer_tracker.remove_transfer(shard_idx).await;
+
+        // Check if all assets are received
+        self.check_and_load_model().await;
+    }
+
+    /// Handle direct weight transfer (legacy single-message transfer)
+    async fn handle_direct_weight(&self, model_name: &str, path: &str, data: &[u8]) {
+        tracing::info!("Received direct weight transfer for model {}: {}", model_name, path);
+
+        let shard_index = extract_shard_index(path)
+            .unwrap_or_else(|| "0".to_string());
+
+        if let Err(e) = self.weight_loader.load_weights(model_name, &shard_index, data).await {
+            tracing::error!("Failed to save weight shard: {:?}", e);
+        } else {
+            tracing::info!("Direct weight shard {} saved", shard_index);
         }
     }
 
@@ -516,7 +751,7 @@ impl ZenohClient {
     async fn handle_model_load_subscriber(
         &self,
         subscriber: Subscriber<FifoChannelHandler<Sample>>,
-    ) -> Result<()> {
+    ) {
         tracing::info!("Handling model load requests");
 
         loop {
@@ -535,8 +770,8 @@ impl ZenohClient {
                     }
                 }
                 Err(e) => {
-                    tracing::error!("Model load subscriber error: {:?}", e);
-                    anyhow::bail!("Model load subscriber error: {:?}", e);
+                    tracing::error!("Model load subscriber error: {:?}, retrying...", e);
+                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                 }
             }
         }
@@ -546,7 +781,7 @@ impl ZenohClient {
     async fn handle_inference_requests(
         &self,
         subscriber: Subscriber<FifoChannelHandler<Sample>>,
-    ) -> Result<()> {
+    ) {
         tracing::info!("Handling inference requests");
 
         loop {
@@ -570,11 +805,7 @@ impl ZenohClient {
                         if !is_loaded {
                             tracing::warn!("Model not loaded, cannot process inference request");
 
-                            let error_result = serde_json::json!({
-                                "error": "Model not loaded yet",
-                                "request_id": request.request_id
-                            });
-                            let _ = self.submit_result(&request.request_id, &error_result.to_string()).await;
+                            let _ = self.submit_result(&request.request_id, "Model not loaded yet", 0).await;
                             continue;
                         }
 
@@ -590,11 +821,11 @@ impl ZenohClient {
                             request.max_tokens.unwrap_or(1024),
                             request.temperature,
                         ).await {
-                            Ok(result) => {
-                                tracing::info!("Inference result: {}", result);
+                            Ok((result, token_count)) => {
+                                tracing::info!("Inference result: {} ({} tokens)", result, token_count);
 
                                 // Submit result back to coordinator
-                                if let Err(e) = self.submit_result(&request.request_id, &result).await {
+                                if let Err(e) = self.submit_result(&request.request_id, &result, token_count).await {
                                     tracing::error!("Failed to submit inference result: {:?}", e);
                                 }
                             }
@@ -602,13 +833,10 @@ impl ZenohClient {
                                 tracing::error!("Inference failed: {:?}", e);
 
                                 // Submit error result
-                                let error_result = serde_json::json!({
-                                    "error": format!("{:?}", e),
-                                    "request_id": request.request_id
-                                });
                                 if let Err(submit_err) = self.submit_result(
                                     &request.request_id,
-                                    &error_result.to_string()
+                                    &format!("Inference failed: {:?}", e),
+                                    0
                                 ).await {
                                     tracing::error!("Failed to submit error result: {:?}", submit_err);
                                 }
@@ -619,8 +847,8 @@ impl ZenohClient {
                     }
                 }
                 Err(e) => {
-                    tracing::error!("Inference subscriber error: {:?}", e);
-                    anyhow::bail!("Inference subscriber error: {:?}", e);
+                    tracing::error!("Inference subscriber error: {:?}, retrying...", e);
+                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                 }
             }
         }

@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use std::fs;
 use std::path::PathBuf;
+use tokio::fs as tokio_fs;
 
 /// Loader for model weights from various sources
 ///
@@ -100,6 +101,50 @@ impl WeightLoader {
         Ok(tokenizer_path)
     }
 
+    /// Load tokenizer_config.json from bytes received via Zenoh
+    ///
+    /// # Arguments
+    /// * `model_name` - The model identifier
+    /// * `tokenizer_config_data` - Raw tokenizer_config bytes (JSON)
+    ///
+    /// # Returns
+    /// Path to the saved tokenizer_config file
+    pub async fn load_tokenizer_config(&self, model_name: &str, tokenizer_config_data: &[u8]) -> Result<PathBuf> {
+        let model_dir = self.model_dir(model_name);
+
+        let tokenizer_config_path = model_dir.join("tokenizer_config.json");
+
+        // Write tokenizer_config to file
+        fs::write(&tokenizer_config_path, tokenizer_config_data)
+            .with_context(|| format!("Failed to write tokenizer_config to: {:?}", tokenizer_config_path))?;
+
+        tracing::info!("Saved tokenizer_config for model '{}' to: {:?}", model_name, tokenizer_config_path);
+
+        Ok(tokenizer_config_path)
+    }
+
+    /// Load generation_config.json from bytes received via Zenoh
+    ///
+    /// # Arguments
+    /// * `model_name` - The model identifier
+    /// * `generation_config_data` - Raw generation_config bytes (JSON)
+    ///
+    /// # Returns
+    /// Path to the saved generation_config file
+    pub async fn load_generation_config(&self, model_name: &str, generation_config_data: &[u8]) -> Result<PathBuf> {
+        let model_dir = self.model_dir(model_name);
+
+        let generation_config_path = model_dir.join("generation_config.json");
+
+        // Write generation_config to file
+        fs::write(&generation_config_path, generation_config_data)
+            .with_context(|| format!("Failed to write generation_config to: {:?}", generation_config_path))?;
+
+        tracing::info!("Saved generation_config for model '{}' to: {:?}", model_name, generation_config_path);
+
+        Ok(generation_config_path)
+    }
+
     /// Load weight shard from bytes received via Zenoh
     ///
     /// # Arguments
@@ -133,6 +178,124 @@ impl WeightLoader {
             "Saved weight shard '{}' for model '{}' to: {:?}",
             shard_filename,
             model_name,
+            weight_path
+        );
+
+        Ok(weight_path)
+    }
+
+    /// Start receiving a chunked weight shard
+    ///
+    /// # Arguments
+    /// * `model_name` - The model identifier
+    /// * `shard_index` - Index of the weight shard (e.g., "000")
+    ///
+    /// # Returns
+    /// Path to the pending weight shard file
+    pub async fn start_chunked_weight_reception(
+        &self,
+        model_name: &str,
+        shard_index: &str,
+        file_size: u64,
+        total_chunks: u32,
+    ) -> Result<PathBuf> {
+        let weights_dir = self.weights_dir(model_name);
+
+        // Create weights directory if it doesn't exist
+        fs::create_dir_all(&weights_dir)
+            .with_context(|| format!("Failed to create weights directory: {:?}", weights_dir))?;
+
+        // Format shard filename
+        let shard_filename = format!("shard-{:03}.safetensors", shard_index.parse::<u32>().unwrap_or(0));
+        let weight_path = weights_dir.join(&shard_filename);
+
+        // Create the file
+        let file = fs::File::create(&weight_path)
+            .with_context(|| format!("Failed to create weight file: {:?}", weight_path))?;
+
+        // Pre-allocate file space (Unix-specific)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileExt;
+            let _ = file.write_all_at(&[0u8; 1], file_size - 1); // Ignore errors, this is just a hint
+        }
+
+        tracing::info!(
+            "Starting chunked weight reception: {} ({} bytes, {} chunks)",
+            weight_path.display(), file_size, total_chunks
+        );
+
+        Ok(weight_path)
+    }
+
+    /// Write a chunk to an ongoing weight reception
+    ///
+    /// # Arguments
+    /// * `model_name` - The model identifier
+    /// * `shard_index` - Index of the weight shard
+    /// * `chunk_index` - Index of the chunk
+    /// * `chunk_data` - Raw chunk bytes
+    ///
+    /// # Returns
+    /// Result indicating success or failure
+    pub async fn write_weight_chunk(
+        &self,
+        model_name: &str,
+        shard_index: &str,
+        chunk_index: u32,
+        chunk_data: &[u8],
+    ) -> Result<()> {
+        let weights_dir = self.weights_dir(model_name);
+        let shard_filename = format!("shard-{:03}.safetensors", shard_index.parse::<u32>().unwrap_or(0));
+        let weight_path = weights_dir.join(&shard_filename);
+
+        let offset = chunk_index as u64 * 1024 * 1024; // 1MB chunk size
+
+        // Use blocking I/O in a tokio blocking task for file writes at specific offsets
+        let chunk_data = chunk_data.to_vec();
+        let weight_path_clone = weight_path.clone();
+
+        tokio::task::spawn_blocking(move || {
+            use std::io::{Write, Seek};
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&weight_path_clone)
+                .with_context(|| format!("Failed to open weight file: {:?}", weight_path_clone))?;
+
+            file.seek(std::io::SeekFrom::Start(offset))
+                .with_context(|| format!("Failed to seek to offset {}", offset))?;
+
+            file.write_all(&chunk_data)
+                .with_context(|| format!("Failed to write chunk at offset {}", offset))?;
+
+            Ok::<(), anyhow::Error>(())
+        }).await
+        .with_context(|| "Failed to execute blocking I/O task")??;
+
+        tracing::debug!("Wrote chunk {} for shard {}", chunk_index, shard_filename);
+
+        Ok(())
+    }
+
+    /// Finalize chunked weight reception
+    ///
+    /// # Arguments
+    /// * `model_name` - The model identifier
+    /// * `shard_index` - Index of the weight shard
+    ///
+    /// # Returns
+    /// Path to the completed weight shard file
+    pub async fn finalize_chunked_weight_reception(
+        &self,
+        model_name: &str,
+        shard_index: &str,
+    ) -> Result<PathBuf> {
+        let weights_dir = self.weights_dir(model_name);
+        let shard_filename = format!("shard-{:03}.safetensors", shard_index.parse::<u32>().unwrap_or(0));
+        let weight_path = weights_dir.join(&shard_filename);
+
+        tracing::info!(
+            "Finalized chunked weight reception: {:?}",
             weight_path
         );
 
