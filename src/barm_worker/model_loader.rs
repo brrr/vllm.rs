@@ -94,7 +94,7 @@ impl ModelEngine {
         }
 
         // Get the weights directory
-        let weights_dir = model_dir.join("weights");
+        let _weights_dir = model_dir.join("weights");
         // Pass the model_dir as weight_path, not the weights subdirectory
         // The downloader will check for weights/shard-000.safetensors within model_dir
         let weight_path = model_dir.to_string_lossy().to_string();
@@ -163,7 +163,7 @@ impl ModelEngine {
     ///
     /// # Returns
     /// The generated text and token count
-    pub async fn complete(&self, prompt: &str, max_tokens: usize, temperature: Option<f32>) -> Result<(String, usize)> {
+    pub async fn complete(&self, prompt: &str, max_tokens: usize, _temperature: Option<f32>) -> Result<(String, usize)> {
         let engine = self.engine.clone();
         let prompt = prompt.to_string();
 
@@ -269,7 +269,7 @@ impl ModelEngine {
 
         // Spawn the inference task
         tokio::spawn(async move {
-            if let Err(e) = tokio::task::spawn_blocking(move || {
+            if let Err(_e) = tokio::task::spawn_blocking(move || {
                 use crate::utils::chat_template::Message;
                 use std::vec;
 

@@ -1,5 +1,5 @@
 use candle_core::Result;
-use clap::{Parser, Arg, ArgAction};
+use clap::Parser;
 use colored::Colorize;
 use reedline::{DefaultPrompt, DefaultPromptSegment, Reedline, Signal};
 use serde_json;

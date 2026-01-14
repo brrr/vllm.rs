@@ -272,7 +272,7 @@ impl ZenohClient {
             }
         });
         // Initial declaration
-        self.session.liveliness().declare_token(&key).await
+        let _token = self.session.liveliness().declare_token(&key).await
             .map_err(|e| anyhow::anyhow!("Failed to declare liveliness token: {:?}", e))?;
         Ok(())
     }
@@ -476,31 +476,31 @@ impl ZenohClient {
         let mut shutdown_rx = self.shutdown.rx.clone();
 
         // Spawn all handlers as independent tasks
-        let config_h = tokio::spawn(async move {
+        let _config_h = tokio::spawn(async move {
             self_for_config.handle_config_subscriber(config_sub, &model_name_for_config).await
         });
-        let tokenizer_h = tokio::spawn(async move {
+        let _tokenizer_h = tokio::spawn(async move {
             self_for_tokenizer.handle_tokenizer_subscriber(tokenizer_sub, &model_name_for_tokenizer).await
         });
-        let tokenizer_config_h = tokio::spawn(async move {
+        let _tokenizer_config_h = tokio::spawn(async move {
             self_for_tokenizer_config.handle_tokenizer_config_subscriber(tokenizer_config_sub, &model_name_for_tokenizer_config).await
         });
-        let generation_config_h = tokio::spawn(async move {
+        let _generation_config_h = tokio::spawn(async move {
             self_for_generation_config.handle_generation_config_subscriber(generation_config_sub, &model_name_for_generation_config).await
         });
-        let vocab_h = tokio::spawn(async move {
+        let _vocab_h = tokio::spawn(async move {
             self_for_vocab.handle_vocab_subscriber(vocab_sub, &model_name_for_vocab).await
         });
-        let merges_h = tokio::spawn(async move {
+        let _merges_h = tokio::spawn(async move {
             self_for_merges.handle_merges_subscriber(merges_sub, &model_name_for_merges).await
         });
-        let weights_h = tokio::spawn(async move {
+        let _weights_h = tokio::spawn(async move {
             self_for_weights.handle_weights_subscriber(weights_sub, &model_name_for_weights).await
         });
-        let model_load_h = tokio::spawn(async move {
+        let _model_load_h = tokio::spawn(async move {
             self_for_model_load.handle_model_load_subscriber(model_load_sub).await
         });
-        let inference_h = tokio::spawn(async move {
+        let _inference_h = tokio::spawn(async move {
             self_for_inference.handle_inference_requests(inference_sub).await
         });
 
@@ -756,7 +756,7 @@ impl ZenohClient {
     ) {
         tracing::info!("Handling weight messages for model: {}", model_name);
 
-        let mut weight_count = 0;
+        let _weight_count = 0;
 
         loop {
             match subscriber.recv_async().await {
@@ -856,7 +856,7 @@ impl ZenohClient {
     }
 
     /// Handle weight done signal (end of chunked transfer)
-    async fn handle_weight_done(&self, model_name: &str, path: &str, data: &[u8]) {
+    async fn handle_weight_done(&self, model_name: &str, path: &str, _data: &[u8]) {
         let shard_index = extract_shard_index(path)
             .unwrap_or_else(|| "0".to_string());
 

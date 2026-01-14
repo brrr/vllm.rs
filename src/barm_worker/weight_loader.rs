@@ -1,7 +1,6 @@
 use anyhow::{Context, Result};
 use std::fs;
 use std::path::PathBuf;
-use tokio::fs as tokio_fs;
 
 /// Loader for model weights from various sources
 ///
@@ -14,7 +13,7 @@ pub struct WeightLoader {
     /// Local cache directory for weights
     cache_dir: PathBuf,
     /// Remote storage base URL (optional)
-    remote_base_url: Option<String>,
+    _remote_base_url: Option<String>,
 }
 
 impl WeightLoader {
@@ -35,7 +34,7 @@ impl WeightLoader {
 
         Self {
             cache_dir,
-            remote_base_url,
+            _remote_base_url: remote_base_url,
         }
     }
 
