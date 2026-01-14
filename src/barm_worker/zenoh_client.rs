@@ -940,7 +940,7 @@ impl ZenohClient {
 
                     // Parse inference request
                     if let Ok(request) = serde_json::from_slice::<InferenceRequest>(bytes.as_ref()) {
-                        tracing::info!("Processing inference request: {:?}", request);
+                        tracing::info!("Processing inference request: {:?}, stream: {}", request, request.stream);
 
                         // Check if model is loaded BEFORE entering async context
                         let is_loaded = {
@@ -961,30 +961,44 @@ impl ZenohClient {
                             engine.clone()
                         };
 
-                        // Run inference
-                        match engine_clone.complete(
-                            &request.prompt,
-                            request.max_tokens.unwrap_or(1024),
-                            request.temperature,
-                        ).await {
-                            Ok((result, token_count)) => {
-                                tracing::info!("Inference result: {} ({} tokens)", result, token_count);
-
-                                // Submit result back to coordinator
-                                if let Err(e) = self.submit_result(&request.request_id, &result, token_count).await {
-                                    tracing::error!("Failed to submit inference result: {:?}", e);
-                                }
+                        // Handle streaming or non-streaming
+                        if request.stream {
+                            // Handle streaming inference
+                            if let Err(e) = self.handle_streaming_inference(
+                                engine_clone,
+                                &request.request_id,
+                                &request.prompt,
+                                request.max_tokens.unwrap_or(1024),
+                                request.temperature,
+                            ).await {
+                                tracing::error!("Streaming inference failed: {:?}", e);
                             }
-                            Err(e) => {
-                                tracing::error!("Inference failed: {:?}", e);
+                        } else {
+                            // Handle non-streaming (batch) inference
+                            match engine_clone.complete(
+                                &request.prompt,
+                                request.max_tokens.unwrap_or(1024),
+                                request.temperature,
+                            ).await {
+                                Ok((result, token_count)) => {
+                                    tracing::info!("Inference result: {} ({} tokens)", result, token_count);
 
-                                // Submit error result
-                                if let Err(submit_err) = self.submit_result(
-                                    &request.request_id,
-                                    &format!("Inference failed: {:?}", e),
-                                    0
-                                ).await {
-                                    tracing::error!("Failed to submit error result: {:?}", submit_err);
+                                    // Submit result back to coordinator
+                                    if let Err(e) = self.submit_result(&request.request_id, &result, token_count).await {
+                                        tracing::error!("Failed to submit inference result: {:?}", e);
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::error!("Inference failed: {:?}", e);
+
+                                    // Submit error result
+                                    if let Err(submit_err) = self.submit_result(
+                                        &request.request_id,
+                                        &format!("Inference failed: {:?}", e),
+                                        0
+                                    ).await {
+                                        tracing::error!("Failed to submit error result: {:?}", submit_err);
+                                    }
                                 }
                             }
                         }
@@ -998,6 +1012,92 @@ impl ZenohClient {
                 }
             }
         }
+    }
+
+    /// Handle streaming inference - publishes tokens to Zenoh as they are generated
+    async fn handle_streaming_inference(
+        &self,
+        engine: super::model_loader::ModelEngine,
+        request_id: &str,
+        prompt: &str,
+        max_tokens: usize,
+        temperature: Option<f32>,
+    ) -> Result<()> {
+        let stream_topic = format!("barm/inference/{}/stream/{}", self.model_name, request_id);
+
+        tracing::info!("Starting streaming inference for request {}, topic: {}", request_id, stream_topic);
+
+        // Get streaming receiver
+        let mut rx = engine.stream_complete(prompt, max_tokens, temperature).await?;
+
+        let mut index = 0u32;
+
+        while let Some(item) = rx.recv().await {
+            match item {
+                crate::core::engine::StreamItem::Token(token_string, _token_id) => {
+                    // Publish token to Zenoh
+                    let stream_token = StreamToken {
+                        request_id: request_id.to_string(),
+                        token: token_string,
+                        index,
+                        done: false,
+                        finish_reason: None,
+                        error: None,
+                    };
+
+                    if let Ok(bytes) = serde_json::to_vec(&stream_token) {
+                        if let Err(e) = self.session.put(&stream_topic, &bytes).await {
+                            tracing::error!("Failed to publish stream token: {:?}", e);
+                        } else {
+                            tracing::trace!("Published token {}: '{}'", index, stream_token.token);
+                        }
+                    }
+                    index += 1;
+                }
+                crate::core::engine::StreamItem::Done(_total_tokens) => {
+                    // Publish final done message
+                    let stream_token = StreamToken {
+                        request_id: request_id.to_string(),
+                        token: String::new(),
+                        index,
+                        done: true,
+                        finish_reason: Some("stop".to_string()),
+                        error: None,
+                    };
+
+                    if let Ok(bytes) = serde_json::to_vec(&stream_token) {
+                        if let Err(e) = self.session.put(&stream_topic, &bytes).await {
+                            tracing::error!("Failed to publish done message: {:?}", e);
+                        } else {
+                            tracing::info!("Stream completed for request {}", request_id);
+                        }
+                    }
+                    break;
+                }
+                crate::core::engine::StreamItem::Error(e) => {
+                    // Publish error message
+                    let stream_token = StreamToken {
+                        request_id: request_id.to_string(),
+                        token: String::new(),
+                        index,
+                        done: true,
+                        finish_reason: Some("error".to_string()),
+                        error: Some(e),
+                    };
+
+                    if let Ok(bytes) = serde_json::to_vec(&stream_token) {
+                        let _ = self.session.put(&stream_topic, &bytes).await;
+                    }
+                    tracing::error!("Streaming inference error for request {}: {}", request_id, stream_token.error.as_deref().unwrap_or("unknown"));
+                    break;
+                }
+                _ => {
+                    // Ignore other item types
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Signal shutdown to all handlers
@@ -1072,6 +1172,28 @@ pub struct InferenceRequest {
     pub top_k: Option<isize>,
     /// Stop sequences
     pub stop_sequences: Option<Vec<String>>,
+    /// Whether to stream the response
+    #[serde(default)]
+    pub stream: bool,
+}
+
+/// Stream token message (Worker -> Coordinator)
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct StreamToken {
+    /// Request ID for tracking
+    pub request_id: String,
+    /// The generated token text
+    pub token: String,
+    /// Token index in the stream
+    pub index: u32,
+    /// Whether this is the last token
+    pub done: bool,
+    /// Reason for finishing (stop, length, error)
+    #[serde(default)]
+    pub finish_reason: Option<String>,
+    /// Error message if any
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 /// Device type for model execution

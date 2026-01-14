@@ -3,10 +3,14 @@ use candle_core::DType;
 use parking_lot::RwLock;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::sync::mpsc;
 use tracing::info;
 
-use crate::core::engine::LLMEngine;
+use crate::core::engine::{LLMEngine, StreamItem};
 use crate::utils::config::{EngineConfig, SamplingParams};
+
+/// Stream token receiver type
+pub type StreamReceiver = mpsc::Receiver<StreamItem>;
 
 /// Memory configuration for model loading
 #[derive(Clone, Debug, Default)]
@@ -237,6 +241,98 @@ impl ModelEngine {
         .context("Inference task failed")??;
 
         Ok(output)
+    }
+
+    /// Run inference with streaming API
+    ///
+    /// # Arguments
+    /// * `prompt` - The input prompt
+    /// * `max_tokens` - Maximum tokens to generate
+    /// * `temperature` - Temperature for sampling
+    ///
+    /// # Returns
+    /// A receiver for stream items (tokens, done, error)
+    pub async fn stream_complete(
+        &self,
+        prompt: &str,
+        max_tokens: usize,
+        temperature: Option<f32>,
+    ) -> Result<StreamReceiver> {
+        let engine = self.engine.clone();
+        let prompt = prompt.to_string();
+
+        // Create channel for stream items
+        let (tx, rx) = mpsc::channel::<StreamItem>(100);
+
+        // Clone tx for error handling in the spawned task
+        let tx_for_error = tx.clone();
+
+        // Spawn the inference task
+        tokio::spawn(async move {
+            if let Err(e) = tokio::task::spawn_blocking(move || {
+                use crate::utils::chat_template::Message;
+                use std::vec;
+
+                let messages = vec![Message {
+                    role: "user".to_string(),
+                    content: prompt.clone(),
+                    num_images: 0,
+                }];
+
+                let sampling_params = SamplingParams {
+                    temperature: temperature.or(Some(1.0)),
+                    max_tokens: Some(max_tokens),
+                    ..Default::default()
+                };
+
+                let engine_ref = engine.as_ref()
+                    .expect("Model not loaded, cannot run inference");
+
+                tokio::task::block_in_place(|| {
+                    let rt = tokio::runtime::Handle::current();
+                    rt.block_on(async {
+                        let mut e = engine_ref.write();
+                        let (formatted_prompt, _) = e.apply_chat_template(
+                            &sampling_params,
+                            &messages,
+                            &vec![],
+                            false,
+                        );
+
+                        let result = e.add_request(
+                            &sampling_params,
+                            &formatted_prompt,
+                            crate::core::engine::RequestType::Stream,
+                            &None,
+                            0,
+                        );
+
+                        drop(e);
+
+                        match result {
+                            Ok((_seq_id, _prompt_length, mut stream_rx)) => {
+                                while let Some(item) = stream_rx.recv().await {
+                                    if tx.send(item).await.is_err() {
+                                        // Receiver dropped, stop streaming
+                                        break;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                let _ = tx.send(StreamItem::Error(format!("Failed to add request: {:?}", e))).await;
+                            }
+                        }
+                    })
+                })
+            })
+            .await
+            {
+                // Task panicked or was cancelled
+                let _ = tx_for_error.send(StreamItem::Error("Inference task failed".to_string())).await;
+            }
+        });
+
+        Ok(rx)
     }
 
     /// Shutdown the engine and release resources
