@@ -83,7 +83,7 @@ pub struct LLMEngine {
     pub tokenizer: Tokenizer,
     pub econfig: EngineConfig,
     default_chat_template: String,
-    template: ChatTemplate,
+    pub template: ChatTemplate,
     stream_decoders: HashMap<usize, super::DecodeStreamType>,
     stream_senders: HashMap<usize, Sender<StreamItem>>,
     request_types: HashMap<usize, RequestType>,
@@ -967,7 +967,7 @@ impl LLMEngine {
         has_requests_to_cancel
     }
 
-    fn apply_chat_template(
+    pub fn apply_chat_template(
         &mut self,
         params: &SamplingParams,
         messages: &Vec<Message>,

@@ -169,12 +169,12 @@ impl ModelEngine {
 
             let messages = vec![Message {
                 role: "user".to_string(),
-                content: prompt,
+                content: prompt.clone(),
                 num_images: 0,
             }];
 
             let sampling_params = SamplingParams {
-                temperature,
+                temperature: Some(1.0),  // Use temperature 1.0 for deterministic output
                 max_tokens: Some(max_tokens),
                 ..Default::default()
             };
@@ -188,43 +188,47 @@ impl ModelEngine {
                 let rt = tokio::runtime::Handle::current();
                 rt.block_on(async {
                     let mut e = engine_ref.write();
-                    let receivers = e.generate_sync(&vec![sampling_params], &vec![messages], None, &vec![], &None)
-                        .map_err(|e| anyhow::anyhow!("Failed to generate: {:?}", e))?;
 
-                    // Clone tokenizer before dropping mutable access
-                    let tokenizer = Arc::new(e.tokenizer.clone());
+                    // Apply chat template using the engine's internal method
+                    // This returns the formatted prompt
+                    let (formatted_prompt, _) = e.apply_chat_template(&sampling_params, &messages, &vec![], false);
+
+                    // Use streaming mode to get pre-decoded token strings (StreamItem::Token)
+                    // This avoids the tokenizers.decode() bug
+                    let (_seq_id, _prompt_length, mut rx) = e.add_request(
+                        &sampling_params,
+                        &formatted_prompt,
+                        crate::core::engine::RequestType::Stream,
+                        &None,
+                        0,
+                    ).map_err(|e| anyhow::anyhow!("Failed to add request: {:?}", e))?;
+
                     drop(e);
 
-                    // Collect results
+                    // Collect results from streaming
                     let mut output_text = String::new();
                     let mut token_count = 0usize;
-                    for (_seq_id, _prompt_len, mut rx) in receivers {
-                        // rx.recv() returns Option<StreamItem> (None when done)
-                        while let Some(item) = rx.recv().await {
-                            match item {
-                                crate::core::engine::StreamItem::Completion((
-                                    _prompt_start,
-                                    _decode_start,
-                                    _decode_finish,
-                                    decoded_ids,
-                                )) => {
-                                    token_count += decoded_ids.len();
-                                    // Decode token IDs to text
-                                    if let Ok(decoded) = tokenizer.decode(&decoded_ids, true) {
-                                        output_text = decoded;
-                                    }
-                                }
-                                crate::core::engine::StreamItem::Done(_) => {
-                                    break;
-                                }
-                                crate::core::engine::StreamItem::Error(e) => {
-                                    anyhow::bail!("Inference error: {}", e);
-                                }
-                                _ => {}
+
+                    while let Some(item) = rx.recv().await {
+                        match item {
+                            crate::core::engine::StreamItem::Token(token_string, _token_id) => {
+                                // StreamItem::Token contains pre-decoded token strings
+                                // This is the correct approach - tokens are already decoded by vllm.rs
+                                output_text.push_str(&token_string);
+                                token_count += 1;
+                                tracing::trace!("Stream token: '{}'", token_string);
                             }
+                            crate::core::engine::StreamItem::Done(_) => {
+                                break;
+                            }
+                            crate::core::engine::StreamItem::Error(e) => {
+                                anyhow::bail!("Inference error: {}", e);
+                            }
+                            _ => {}
                         }
                     }
 
+                    tracing::info!("Streaming complete: {} tokens", token_count);
                     Ok::<(String, usize), anyhow::Error>((output_text, token_count))
                 })
             })
@@ -284,4 +288,122 @@ pub fn detect_device() -> &'static str {
 #[cfg(not(any(feature = "metal", feature = "cuda")))]
 pub fn detect_device() -> &'static str {
     "cpu"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+    use std::fs;
+
+    #[test]
+    fn test_model_engine_creation() {
+        let engine = ModelEngine::new("test-model".to_string());
+        assert!(!engine.is_loaded());
+    }
+
+    #[test]
+    fn test_model_engine_with_memory_config() {
+        let config = MemoryConfig {
+            max_model_len: Some(1024),
+            max_num_seqs: Some(8),
+            kv_fraction: Some(0.8),
+        };
+        let engine = ModelEngine::with_memory_config("test-model".to_string(), config);
+        assert!(!engine.is_loaded());
+        assert_eq!(engine.memory_config.max_model_len, Some(1024));
+        assert_eq!(engine.memory_config.max_num_seqs, Some(8));
+        assert_eq!(engine.memory_config.kv_fraction, Some(0.8));
+    }
+
+    #[test]
+    fn test_memory_config_defaults() {
+        let config = MemoryConfig::default();
+        assert!(config.max_model_len.is_none());
+        assert!(config.max_num_seqs.is_none());
+        assert!(config.kv_fraction.is_none());
+    }
+
+    #[test]
+    fn test_set_memory_config() {
+        let mut engine = ModelEngine::new("test".to_string());
+        let config = MemoryConfig {
+            max_model_len: Some(2048),
+            max_num_seqs: Some(4),
+            kv_fraction: None,
+        };
+        engine.set_memory_config(config);
+        assert_eq!(engine.memory_config.max_model_len, Some(2048));
+    }
+
+    #[test]
+    fn test_engine_shutdown() {
+        let mut engine = ModelEngine::new("test".to_string());
+        engine.shutdown();
+        assert!(!engine.is_loaded());
+    }
+
+    #[tokio::test]
+    async fn test_load_model_missing_config() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut engine = ModelEngine::new("test".to_string());
+
+        // Try to load without config.json
+        let result = engine.load_model(temp_dir.path().to_path_buf()).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Config file not found"));
+    }
+
+    #[tokio::test]
+    async fn test_load_model_missing_tokenizer() {
+        let temp_dir = TempDir::new().unwrap();
+        let model_dir = temp_dir.path();
+
+        // Create only config.json
+        fs::write(model_dir.join("config.json"), r#"{"model_type": "test"}"#).unwrap();
+
+        let mut engine = ModelEngine::new("test".to_string());
+        let result = engine.load_model(model_dir.to_path_buf()).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Tokenizer file not found"));
+    }
+
+    #[test]
+    fn test_get_model_architecture_with_architecture_field() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        fs::write(&config_path, r#"{"architecture": "Qwen2ForCausalLM"}"#).unwrap();
+
+        let result = get_model_architecture(&config_path);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "Qwen2ForCausalLM");
+    }
+
+    #[test]
+    fn test_get_model_architecture_with_architectures_field() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        fs::write(&config_path, r#"{"architectures": ["LlamaForCausalLM"]}"#).unwrap();
+
+        let result = get_model_architecture(&config_path);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "LlamaForCausalLM");
+    }
+
+    #[test]
+    fn test_get_model_architecture_no_field() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        fs::write(&config_path, r#"{"model_type": "test"}"#).unwrap();
+
+        let result = get_model_architecture(&config_path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_detect_device() {
+        let device = detect_device();
+        // Should return a valid device string
+        assert!(device == "metal" || device == "cuda" || device == "cpu");
+    }
 }

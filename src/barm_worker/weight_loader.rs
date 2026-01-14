@@ -145,6 +145,50 @@ impl WeightLoader {
         Ok(generation_config_path)
     }
 
+    /// Load vocab.json from bytes received via Zenoh (needed by BPE tokenizer)
+    ///
+    /// # Arguments
+    /// * `model_name` - The model identifier
+    /// * `vocab_data` - Raw vocab bytes (JSON)
+    ///
+    /// # Returns
+    /// Path to the saved vocab file
+    pub async fn load_vocab(&self, model_name: &str, vocab_data: &[u8]) -> Result<PathBuf> {
+        let model_dir = self.model_dir(model_name);
+
+        let vocab_path = model_dir.join("vocab.json");
+
+        // Write vocab to file
+        fs::write(&vocab_path, vocab_data)
+            .with_context(|| format!("Failed to write vocab to: {:?}", vocab_path))?;
+
+        tracing::info!("Saved vocab for model '{}' to: {:?}", model_name, vocab_path);
+
+        Ok(vocab_path)
+    }
+
+    /// Load merges.txt from bytes received via Zenoh (needed by BPE tokenizer)
+    ///
+    /// # Arguments
+    /// * `model_name` - The model identifier
+    /// * `merges_data` - Raw merges bytes (text)
+    ///
+    /// # Returns
+    /// Path to the saved merges file
+    pub async fn load_merges(&self, model_name: &str, merges_data: &[u8]) -> Result<PathBuf> {
+        let model_dir = self.model_dir(model_name);
+
+        let merges_path = model_dir.join("merges.txt");
+
+        // Write merges to file
+        fs::write(&merges_path, merges_data)
+            .with_context(|| format!("Failed to write merges to: {:?}", merges_path))?;
+
+        tracing::info!("Saved merges for model '{}' to: {:?}", model_name, merges_path);
+
+        Ok(merges_path)
+    }
+
     /// Load weight shard from bytes received via Zenoh
     ///
     /// # Arguments
@@ -506,5 +550,114 @@ mod tests {
 
         let size = loader.cache_size("test-model").unwrap();
         assert!(size > 0);
+    }
+
+    #[tokio::test]
+    async fn test_chunked_weight_reception() {
+        let temp_dir = TempDir::new().unwrap();
+        let loader = WeightLoader::new(temp_dir.path().to_path_buf(), None);
+
+        // Test chunked transfer workflow
+        let model_name = "test-chunked";
+        let shard_index = "000";
+        let file_size = 2 * 1024 * 1024u64; // 2MB
+        let chunk_size = 1024 * 1024; // 1MB
+        let total_chunks = 2u32;
+
+        // Start chunked reception
+        let result = loader.start_chunked_weight_reception(
+            model_name, shard_index, file_size, total_chunks
+        ).await;
+        assert!(result.is_ok());
+
+        // Write first chunk
+        let chunk1_data = vec![0x42u8; chunk_size]; // 1MB of 0x42
+        let result = loader.write_weight_chunk(model_name, shard_index, 0, &chunk1_data).await;
+        assert!(result.is_ok());
+
+        // Write second chunk
+        let chunk2_data = vec![0x43u8; chunk_size]; // 1MB of 0x43
+        let result = loader.write_weight_chunk(model_name, shard_index, 1, &chunk2_data).await;
+        assert!(result.is_ok());
+
+        // Finalize
+        let result = loader.finalize_chunked_weight_reception(model_name, shard_index).await;
+        assert!(result.is_ok());
+        let weight_path = result.unwrap();
+        assert!(weight_path.exists());
+
+        // Verify file content at expected positions
+        let content = fs::read(&weight_path).unwrap();
+        assert_eq!(content[0], 0x42); // First chunk data
+        assert_eq!(content[chunk_size], 0x43); // Second chunk data
+    }
+
+    #[tokio::test]
+    async fn test_load_vocab_and_merges() {
+        let temp_dir = TempDir::new().unwrap();
+        let loader = WeightLoader::new(temp_dir.path().to_path_buf(), None);
+
+        // Create model directory first (required for load_vocab and load_merges)
+        let model_dir = temp_dir.path().join("test-model");
+        fs::create_dir_all(&model_dir).unwrap();
+
+        // Test vocab.json loading
+        let vocab_data = r#"{"hello": 0, "world": 1}"#;
+        let result = loader.load_vocab("test-model", vocab_data.as_bytes()).await;
+        assert!(result.is_ok());
+        let vocab_path = result.unwrap();
+        assert!(vocab_path.exists());
+        let saved_vocab = fs::read_to_string(&vocab_path).unwrap();
+        assert_eq!(saved_vocab, vocab_data);
+
+        // Test merges.txt loading
+        let merges_data = "he ll\nwo rld\n";
+        let result = loader.load_merges("test-model", merges_data.as_bytes()).await;
+        assert!(result.is_ok());
+        let merges_path = result.unwrap();
+        assert!(merges_path.exists());
+        let saved_merges = fs::read_to_string(&merges_path).unwrap();
+        assert_eq!(saved_merges, merges_data);
+    }
+
+    #[test]
+    fn test_is_model_cached_with_shards() {
+        let temp_dir = TempDir::new().unwrap();
+        let loader = WeightLoader::new(temp_dir.path().to_path_buf(), None);
+
+        let model_dir = temp_dir.path().join("test-sharded");
+        let weights_dir = model_dir.join("weights");
+        fs::create_dir_all(&weights_dir).unwrap();
+
+        // Create config and tokenizer
+        fs::write(model_dir.join("config.json"), "{}").unwrap();
+        fs::write(model_dir.join("tokenizer.json"), "{}").unwrap();
+
+        // Create 2 shards
+        fs::write(weights_dir.join("shard-000.safetensors"), "data0").unwrap();
+        fs::write(weights_dir.join("shard-001.safetensors"), "data1").unwrap();
+
+        // Check with expected number of shards
+        assert!(loader.is_model_cached("test-sharded", 2));
+
+        // Check with wrong number of shards
+        assert!(!loader.is_model_cached("test-sharded", 3));
+    }
+
+    #[test]
+    fn test_clear_cache() {
+        let temp_dir = TempDir::new().unwrap();
+        let loader = WeightLoader::new(temp_dir.path().to_path_buf(), None);
+
+        let model_dir = temp_dir.path().join("test-clear");
+        fs::create_dir_all(&model_dir).unwrap();
+        fs::write(model_dir.join("config.json"), "{}").unwrap();
+
+        assert!(loader.is_cached("test-clear"));
+
+        let result = loader.clear_cache("test-clear");
+        assert!(result.is_ok());
+
+        assert!(!loader.is_cached("test-clear"));
     }
 }

@@ -37,6 +37,8 @@ impl ShutdownSignal {
 struct AssetTracker {
     pub config_received: Arc<AtomicBool>,
     pub tokenizer_received: Arc<AtomicBool>,
+    pub vocab_received: Arc<AtomicBool>,
+    pub merges_received: Arc<AtomicBool>,
     pub weights_received: Arc<AtomicBool>,
 }
 
@@ -45,6 +47,8 @@ impl AssetTracker {
         Self {
             config_received: Arc::new(AtomicBool::new(false)),
             tokenizer_received: Arc::new(AtomicBool::new(false)),
+            vocab_received: Arc::new(AtomicBool::new(false)),
+            merges_received: Arc::new(AtomicBool::new(false)),
             weights_received: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -54,6 +58,9 @@ impl AssetTracker {
         self.config_received.load(Ordering::SeqCst)
             && self.tokenizer_received.load(Ordering::SeqCst)
             && self.weights_received.load(Ordering::SeqCst)
+            // Note: vocab and merges are optional for some tokenizers (like sentencepiece)
+            // They will be marked received when received, but don't block model loading
+            && (self.vocab_received.load(Ordering::SeqCst) || self.merges_received.load(Ordering::SeqCst) || true)
     }
 
     /// Mark a specific asset as received
@@ -63,6 +70,14 @@ impl AssetTracker {
 
     fn mark_tokenizer_received(&self) {
         self.tokenizer_received.store(true, Ordering::SeqCst);
+    }
+
+    fn mark_vocab_received(&self) {
+        self.vocab_received.store(true, Ordering::SeqCst);
+    }
+
+    fn mark_merges_received(&self) {
+        self.merges_received.store(true, Ordering::SeqCst);
     }
 
     fn mark_weights_received(&self) {
@@ -336,6 +351,36 @@ impl ZenohClient {
         Ok(subscriber)
     }
 
+    /// Subscribe to vocab updates (needed by BPE tokenizer)
+    ///
+    /// # Arguments
+    /// * `model_name` - The model name to subscribe to
+    ///
+    /// # Returns
+    /// A subscriber for vocab messages
+    pub async fn subscribe_vocab(&self, model_name: &str) -> Result<Subscriber<FifoChannelHandler<Sample>>> {
+        let key_expr = format!("barm/model/{}/vocab", model_name);
+        let subscriber = self.session.declare_subscriber(&key_expr).await
+            .map_err(|e| anyhow::anyhow!("Failed to declare vocab subscriber: {:?}", e))?;
+        tracing::info!("Subscribed to vocab: {}", key_expr);
+        Ok(subscriber)
+    }
+
+    /// Subscribe to merges updates (needed by BPE tokenizer)
+    ///
+    /// # Arguments
+    /// * `model_name` - The model name to subscribe to
+    ///
+    /// # Returns
+    /// A subscriber for merges messages
+    pub async fn subscribe_merges(&self, model_name: &str) -> Result<Subscriber<FifoChannelHandler<Sample>>> {
+        let key_expr = format!("barm/model/{}/merges", model_name);
+        let subscriber = self.session.declare_subscriber(&key_expr).await
+            .map_err(|e| anyhow::anyhow!("Failed to declare merges subscriber: {:?}", e))?;
+        tracing::info!("Subscribed to merges: {}", key_expr);
+        Ok(subscriber)
+    }
+
     /// Subscribe to weight updates (sharded safetensors)
     ///
     /// # Arguments
@@ -401,6 +446,8 @@ impl ZenohClient {
         let tokenizer_sub = self.subscribe_tokenizer(model_name).await?;
         let tokenizer_config_sub = self.subscribe_tokenizer_config(model_name).await?;
         let generation_config_sub = self.subscribe_generation_config(model_name).await?;
+        let vocab_sub = self.subscribe_vocab(model_name).await?;
+        let merges_sub = self.subscribe_merges(model_name).await?;
         let weights_sub = self.subscribe_weights(model_name).await?;
         let model_load_sub = self.subscribe_model_load().await?;
         let inference_sub = self.subscribe_inference_requests().await?;
@@ -414,11 +461,15 @@ impl ZenohClient {
         let model_name_for_tokenizer = model_name.clone();
         let model_name_for_tokenizer_config = model_name.clone();
         let model_name_for_generation_config = model_name.clone();
+        let model_name_for_vocab = model_name.clone();
+        let model_name_for_merges = model_name.clone();
         let model_name_for_weights = model_name.clone();
         let self_for_config = self.clone();
         let self_for_tokenizer = self.clone();
         let self_for_tokenizer_config = self.clone();
         let self_for_generation_config = self.clone();
+        let self_for_vocab = self.clone();
+        let self_for_merges = self.clone();
         let self_for_weights = self.clone();
         let self_for_model_load = self.clone();
         let self_for_inference = self.clone();
@@ -436,6 +487,12 @@ impl ZenohClient {
         });
         let generation_config_h = tokio::spawn(async move {
             self_for_generation_config.handle_generation_config_subscriber(generation_config_sub, &model_name_for_generation_config).await
+        });
+        let vocab_h = tokio::spawn(async move {
+            self_for_vocab.handle_vocab_subscriber(vocab_sub, &model_name_for_vocab).await
+        });
+        let merges_h = tokio::spawn(async move {
+            self_for_merges.handle_merges_subscriber(merges_sub, &model_name_for_merges).await
         });
         let weights_h = tokio::spawn(async move {
             self_for_weights.handle_weights_subscriber(weights_sub, &model_name_for_weights).await
@@ -623,6 +680,68 @@ impl ZenohClient {
                 }
                 Err(e) => {
                     tracing::error!("Generation_config subscriber error: {:?}, retrying...", e);
+                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                }
+            }
+        }
+    }
+
+    /// Handle vocab messages (needed by BPE tokenizer)
+    async fn handle_vocab_subscriber(
+        &self,
+        subscriber: Subscriber<FifoChannelHandler<Sample>>,
+        model_name: &str,
+    ) {
+        tracing::info!("Handling vocab messages for model: {}", model_name);
+
+        loop {
+            match subscriber.recv_async().await {
+                Ok(sample) => {
+                    let path = sample.key_expr().to_string();
+                    tracing::info!("Received vocab for model {}: {}", model_name, path);
+
+                    let bytes = sample.payload().to_bytes();
+                    if let Err(e) = self.weight_loader.load_vocab(model_name, bytes.as_ref()).await {
+                        tracing::error!("Failed to save vocab: {:?}", e);
+                    } else {
+                        // Mark vocab as received
+                        self.asset_tracker.mark_vocab_received();
+                        tracing::info!("Vocab received and saved for model: {}", model_name);
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Vocab subscriber error: {:?}, retrying...", e);
+                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                }
+            }
+        }
+    }
+
+    /// Handle merges messages (needed by BPE tokenizer)
+    async fn handle_merges_subscriber(
+        &self,
+        subscriber: Subscriber<FifoChannelHandler<Sample>>,
+        model_name: &str,
+    ) {
+        tracing::info!("Handling merges messages for model: {}", model_name);
+
+        loop {
+            match subscriber.recv_async().await {
+                Ok(sample) => {
+                    let path = sample.key_expr().to_string();
+                    tracing::info!("Received merges for model {}: {}", model_name, path);
+
+                    let bytes = sample.payload().to_bytes();
+                    if let Err(e) = self.weight_loader.load_merges(model_name, bytes.as_ref()).await {
+                        tracing::error!("Failed to save merges: {:?}", e);
+                    } else {
+                        // Mark merges as received
+                        self.asset_tracker.mark_merges_received();
+                        tracing::info!("Merges received and saved for model: {}", model_name);
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Merges subscriber error: {:?}, retrying...", e);
                     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                 }
             }
