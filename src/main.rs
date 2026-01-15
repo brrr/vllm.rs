@@ -40,10 +40,19 @@ struct BarmWorkerArgs {
     /// KV cache memory fraction (0.0-1.0)
     #[arg(long, hide = true)]
     kv_fraction: Option<f32>,
+    /// W3C traceparent for distributed tracing (format: 00-traceId-spanId-01)
+    #[arg(long, hide = true)]
+    traceparent: Option<String>,
+    /// OpenTelemetry OTLP endpoint for tracing
+    #[arg(long, hide = true)]
+    otlp_endpoint: Option<String>,
+    /// Worker ID for tracing
+    #[arg(long, hide = true)]
+    worker_id: Option<String>,
 }
 
 // Import for barm worker module
-use vllm_rs::barm_worker;
+use vllm_rs::barm_worker as barm_worker_module;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -62,14 +71,20 @@ async fn main() -> Result<()> {
         let model_name = barm_args.model_name.unwrap_or_else(|| "default-model".to_string());
         let cache_dir = barm_args.cache_dir.unwrap_or_else(|| std::path::PathBuf::from("/tmp/barm-cache"));
 
-        if let Err(e) = barm_worker::run(
+        // Build config with trace context
+        let worker_id = barm_args.worker_id
+            .unwrap_or_else(|| format!("vllm-rs-{}", uuid::Uuid::new_v4().to_string().split('-').next().unwrap_or("unknown")));
+
+        let config = barm_worker_module::BarmWorkerConfig::new(
             zenoh_peer,
             model_name,
             cache_dir,
-            barm_args.max_model_len,
-            barm_args.max_num_seqs,
-            barm_args.kv_fraction,
-        ).await {
+        )
+        .with_memory_config(barm_args.max_model_len, barm_args.max_num_seqs, barm_args.kv_fraction)
+        .with_trace_context(barm_args.traceparent)
+        .with_worker_id(worker_id);
+
+        if let Err(e) = barm_worker_module::run(config).await {
             tracing::error!("Barm worker error: {:?}", e);
             return Err(candle_core::Error::msg(e.to_string()));
         }

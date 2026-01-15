@@ -940,7 +940,19 @@ impl ZenohClient {
 
                     // Parse inference request
                     if let Ok(request) = serde_json::from_slice::<InferenceRequest>(bytes.as_ref()) {
-                        tracing::info!("Processing inference request: {:?}, stream: {}", request, request.stream);
+                        tracing::info!(
+                            "Processing inference request: {:?}, stream: {}, trace_id: {}",
+                            request.request_id,
+                            request.stream,
+                            if !request.trace_id.is_empty() { &request.trace_id[..16] } else { "none" }
+                        );
+
+                        // Create trace context from request
+                        let trace_context = if !request.trace_id.is_empty() {
+                            Some((request.trace_id.clone(), request.parent_span_id.clone()))
+                        } else {
+                            None
+                        };
 
                         // Check if model is loaded BEFORE entering async context
                         let is_loaded = {
@@ -970,11 +982,29 @@ impl ZenohClient {
                                 &request.prompt,
                                 request.max_tokens.unwrap_or(1024),
                                 request.temperature,
+                                trace_context.as_ref(),
                             ).await {
                                 tracing::error!("Streaming inference failed: {:?}", e);
                             }
                         } else {
-                            // Handle non-streaming (batch) inference
+                            // Handle non-streaming (batch) inference with trace context
+                            let request_id = request.request_id.clone();
+                            let prompt = request.prompt.clone();
+                            let trace_ctx = trace_context.clone();
+
+                            // Create a span for the inference if trace context is available
+                            let _span = if let Some((ref trace_id, ref parent_span_id)) = trace_ctx {
+                                Some(tracing::info_span!(
+                                    "worker.inference",
+                                    request_id = %request_id,
+                                    trace_id = %trace_id,
+                                    parent_span_id = %parent_span_id,
+                                    prompt_length = %prompt.len(),
+                                ))
+                            } else {
+                                None
+                            };
+
                             match engine_clone.complete(
                                 &request.prompt,
                                 request.max_tokens.unwrap_or(1024),
@@ -1022,8 +1052,22 @@ impl ZenohClient {
         prompt: &str,
         max_tokens: usize,
         temperature: Option<f32>,
+        trace_context: Option<&(String, String)>,
     ) -> Result<()> {
         let stream_topic = format!("barm/inference/{}/stream/{}", self.model_name, request_id);
+
+        // Create span with trace context if available
+        let _span = if let Some((ref trace_id, ref parent_span_id)) = trace_context {
+            Some(tracing::info_span!(
+                "worker.streaming_inference",
+                request_id = %request_id,
+                trace_id = %trace_id,
+                parent_span_id = %parent_span_id,
+                prompt_length = %prompt.len(),
+            ))
+        } else {
+            None
+        };
 
         tracing::info!("Starting streaming inference for request {}, topic: {}", request_id, stream_topic);
 
@@ -1160,6 +1204,15 @@ pub struct ModelLoadRequest {
 pub struct InferenceRequest {
     /// Unique request ID
     pub request_id: String,
+    /// OpenTelemetry trace ID (hex format) for distributed tracing
+    #[serde(default)]
+    pub trace_id: String,
+    /// OpenTelemetry span ID (hex format) for parent span
+    #[serde(default)]
+    pub span_id: String,
+    /// OpenTelemetry parent span ID (hex format)
+    #[serde(default)]
+    pub parent_span_id: String,
     /// The prompt to process
     pub prompt: String,
     /// Maximum tokens to generate
