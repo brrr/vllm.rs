@@ -82,7 +82,8 @@ async fn main() -> Result<()> {
         )
         .with_memory_config(barm_args.max_model_len, barm_args.max_num_seqs, barm_args.kv_fraction)
         .with_trace_context(barm_args.traceparent)
-        .with_worker_id(worker_id);
+        .with_worker_id(worker_id)
+        .with_otlp_endpoint(barm_args.otlp_endpoint);
 
         if let Err(e) = barm_worker_module::run(config).await {
             tracing::error!("Barm worker error: {:?}", e);

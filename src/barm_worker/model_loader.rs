@@ -163,6 +163,7 @@ impl ModelEngine {
     ///
     /// # Returns
     /// The generated text and token count
+    #[tracing::instrument(name = "vllm.inference", skip(self), fields(prompt_len = prompt.len(), max_tokens = max_tokens))]
     pub async fn complete(&self, prompt: &str, max_tokens: usize, _temperature: Option<f32>) -> Result<(String, usize)> {
         let engine = self.engine.clone();
         let prompt = prompt.to_string();
@@ -252,6 +253,7 @@ impl ModelEngine {
     ///
     /// # Returns
     /// A receiver for stream items (tokens, done, error)
+    #[tracing::instrument(name = "vllm.stream_inference", skip(self), fields(prompt_len = prompt.len(), max_tokens = max_tokens))]
     pub async fn stream_complete(
         &self,
         prompt: &str,

@@ -4,6 +4,7 @@ use std::path::PathBuf;
 pub mod zenoh_client;
 pub mod weight_loader;
 pub mod model_loader;
+pub mod telemetry;
 
 pub use zenoh_client::ZenohClient;
 pub use weight_loader::WeightLoader;
@@ -66,6 +67,8 @@ pub struct BarmWorkerConfig {
     pub trace_context: TraceContext,
     /// Worker ID for identification
     pub worker_id: String,
+    /// OTLP endpoint for OpenTelemetry tracing (optional)
+    pub otlp_endpoint: Option<String>,
 }
 
 impl BarmWorkerConfig {
@@ -82,7 +85,14 @@ impl BarmWorkerConfig {
             memory_config: MemoryConfig::default(),
             trace_context: TraceContext::default(),
             worker_id: format!("vllm-rs-{}", uuid::Uuid::new_v4().to_string().split('-').next().unwrap_or("unknown")),
+            otlp_endpoint: None,
         }
+    }
+
+    /// Set OTLP endpoint for OpenTelemetry tracing
+    pub fn with_otlp_endpoint(mut self, endpoint: Option<String>) -> Self {
+        self.otlp_endpoint = endpoint;
+        self
     }
 
     /// Set memory configuration
@@ -118,6 +128,18 @@ impl BarmWorkerConfig {
 /// # Returns
 /// Result indicating success or failure
 pub async fn run(config: BarmWorkerConfig) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Initialize OpenTelemetry tracing if endpoint is configured
+    if let Some(ref endpoint) = config.otlp_endpoint {
+        let telemetry_config = telemetry::VllmTelemetryConfig {
+            service_name: format!("vllm-rs-{}", config.model_name),
+            otlp_endpoint: Some(endpoint.clone()),
+            sampling_rate: 1.0,
+        };
+        if let Err(e) = telemetry::init_vllm_telemetry(&telemetry_config) {
+            tracing::warn!(error = %e, "Failed to initialize OpenTelemetry tracing");
+        }
+    }
+
     // Log trace context if available
     if let Some(ref tp) = config.trace_context.traceparent {
         tracing::info!(

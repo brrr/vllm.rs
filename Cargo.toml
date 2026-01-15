@@ -21,6 +21,12 @@ half = { version = "2.5.0", features = ["num-traits", "use-intrinsics", "rand_di
 tokio = { version = "1.38.0", features = ["sync"] }
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
+
+# OpenTelemetry for distributed tracing
+opentelemetry = { workspace = true }
+opentelemetry-otlp = { workspace = true, features = ["grpc-tonic", "trace"] }
+opentelemetry_sdk = { workspace = true, features = ["rt-tokio"] }
+tracing-opentelemetry = { workspace = true }
 either = { version = "1.13.0", features = ["serde"] }
 minijinja = { version = "2.10.2", features = ["builtins", "json"] }
 minijinja-contrib = { version = "2.10.2", features = ["pycompat"] }
