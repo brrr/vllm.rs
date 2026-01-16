@@ -197,6 +197,16 @@ impl ModelEngine {
                     // Apply chat template using the engine's internal method
                     // This returns the formatted prompt
                     let (formatted_prompt, _) = e.apply_chat_template(&sampling_params, &messages, &vec![], false);
+                    let prompt_tokens = formatted_prompt.len();
+
+                    // Prefill phase: add request to engine
+                    let prefill_start = std::time::Instant::now();
+                    let prefill_span = tracing::info_span!(
+                        "vllm.prefill",
+                        prompt_tokens = prompt_tokens,
+                        duration_ms = tracing::field::Empty,
+                    );
+                    let _prefill_guard = prefill_span.enter();
 
                     // Use streaming mode to get pre-decoded token strings (StreamItem::Token)
                     // This avoids the tokenizers.decode() bug
@@ -208,9 +218,25 @@ impl ModelEngine {
                         0,
                     ).map_err(|e| anyhow::anyhow!("Failed to add request: {:?}", e))?;
 
-                    drop(e);
+                    // Record prefill duration before dropping guard
+                    let prefill_duration = prefill_start.elapsed();
+                    tracing::Span::current().record("duration_ms", prefill_duration.as_millis() as i64);
 
-                    // Collect results from streaming
+                    drop(e);
+                    drop(_prefill_guard);
+                    tracing::info!(prompt_tokens = prompt_tokens, duration_ms = prefill_duration.as_millis(), "Prefill complete");
+
+                    // Decode phase: collect generated tokens
+                    let decode_start = std::time::Instant::now();
+                    let decode_span = tracing::info_span!(
+                        "vllm.decode",
+                        max_tokens = max_tokens,
+                        generated_tokens = tracing::field::Empty,
+                        duration_ms = tracing::field::Empty,
+                        tokens_per_second = tracing::field::Empty,
+                    );
+                    let _decode_guard = decode_span.enter();
+
                     let mut output_text = String::new();
                     let mut token_count = 0usize;
 
@@ -233,7 +259,25 @@ impl ModelEngine {
                         }
                     }
 
-                    tracing::info!("Streaming complete: {} tokens", token_count);
+                    // Calculate and record decode metrics
+                    let decode_duration = decode_start.elapsed();
+                    let tps = if decode_duration.as_secs_f64() > 0.0 {
+                        token_count as f64 / decode_duration.as_secs_f64()
+                    } else {
+                        0.0
+                    };
+
+                    tracing::Span::current().record("generated_tokens", token_count as i64);
+                    tracing::Span::current().record("duration_ms", decode_duration.as_millis() as i64);
+                    tracing::Span::current().record("tokens_per_second", format!("{:.2}", tps).as_str());
+
+                    drop(_decode_guard);
+                    tracing::info!(
+                        generated_tokens = token_count,
+                        duration_ms = decode_duration.as_millis(),
+                        tokens_per_second = format!("{:.2}", tps),
+                        "Decode complete"
+                    );
                     Ok::<(String, usize), anyhow::Error>((output_text, token_count))
                 })
             })
@@ -300,6 +344,16 @@ impl ModelEngine {
                             &vec![],
                             false,
                         );
+                        let prompt_tokens = formatted_prompt.len();
+
+                        // Prefill phase
+                        let prefill_start = std::time::Instant::now();
+                        let prefill_span = tracing::info_span!(
+                            "vllm.prefill",
+                            prompt_tokens = prompt_tokens,
+                            duration_ms = tracing::field::Empty,
+                        );
+                        let _prefill_guard = prefill_span.enter();
 
                         let result = e.add_request(
                             &sampling_params,
@@ -309,13 +363,54 @@ impl ModelEngine {
                             0,
                         );
 
+                        // Record prefill duration
+                        let prefill_duration = prefill_start.elapsed();
+                        tracing::Span::current().record("duration_ms", prefill_duration.as_millis() as i64);
+
                         drop(e);
+                        drop(_prefill_guard);
+                        tracing::info!(prompt_tokens = prompt_tokens, duration_ms = prefill_duration.as_millis(), "Stream prefill complete");
+
+                        // Decode phase
+                        let decode_start = std::time::Instant::now();
+                        let decode_span = tracing::info_span!(
+                            "vllm.decode",
+                            max_tokens = max_tokens,
+                            generated_tokens = tracing::field::Empty,
+                            duration_ms = tracing::field::Empty,
+                            tokens_per_second = tracing::field::Empty,
+                        );
+                        let _decode_guard = decode_span.enter();
 
                         match result {
                             Ok((_seq_id, _prompt_length, mut stream_rx)) => {
+                                let mut token_count = 0usize;
                                 while let Some(item) = stream_rx.recv().await {
+                                    if let StreamItem::Token(_, _) = &item {
+                                        token_count += 1;
+                                    }
+                                    let is_done = matches!(&item, StreamItem::Done(_));
                                     if tx.send(item).await.is_err() {
                                         // Receiver dropped, stop streaming
+                                        break;
+                                    }
+                                    if is_done {
+                                        // Calculate and record decode metrics
+                                        let decode_duration = decode_start.elapsed();
+                                        let tps = if decode_duration.as_secs_f64() > 0.0 {
+                                            token_count as f64 / decode_duration.as_secs_f64()
+                                        } else {
+                                            0.0
+                                        };
+                                        tracing::Span::current().record("generated_tokens", token_count as i64);
+                                        tracing::Span::current().record("duration_ms", decode_duration.as_millis() as i64);
+                                        tracing::Span::current().record("tokens_per_second", format!("{:.2}", tps).as_str());
+                                        tracing::info!(
+                                            generated_tokens = token_count,
+                                            duration_ms = decode_duration.as_millis(),
+                                            tokens_per_second = format!("{:.2}", tps),
+                                            "Stream decode complete"
+                                        );
                                         break;
                                     }
                                 }
@@ -324,6 +419,8 @@ impl ModelEngine {
                                 let _ = tx.send(StreamItem::Error(format!("Failed to add request: {:?}", e))).await;
                             }
                         }
+
+                        drop(_decode_guard);
                     })
                 })
             })
